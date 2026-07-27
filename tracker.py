@@ -300,7 +300,7 @@ def emit_transition_event(state, transition, timestamp, detection_method):
 		})
 
 	send_discord_message(
-		title=f"\u2708\ufe0f {state.last_registration} — {transition}",
+		title=f"\u2708\ufe0f {state.last_registration} {transition.title()}",
 		color=color,
 		url=tracking_url,
 		fields=fields or None,
