@@ -39,3 +39,6 @@ Thumbs.db
 *.sav
 notes.txt
 payload.json
+airports.csv
+image.jpg
+tracker.py.sav
