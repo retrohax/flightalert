@@ -1,3 +1,7 @@
+#
+# Download the airports.csv file before running this script.
+# wget https://ourairports.com/data/airports.csv
+#
 import csv
 import io
 import json
@@ -12,14 +16,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
+AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
+AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
+
 POLL_SECONDS_DEFAULT = 60
 POLL_SECONDS_OFFLINE = 900
 POLL_SECONDS_ON_GROUND = 10
 POLL_SECONDS_LOW_ALTITUDE = 10
 POLL_SECONDS_ENROUTE_ALTITUDE = 300
 POLL_THRESHOLD_ALTITUDE = 10000
-AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
-AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
+
+# If an aircraft is within this distance and altitude of an airport,
+# we'll consider it "near" that airport.
+NEAR_AIRPORT_NM_THRESHOLD = 5.0
+NEAR_AIRPORT_AGL_THRESHOLD = 5000
 
 # RapidAPI
 _rapidapi_key = None
@@ -28,11 +38,11 @@ _rapidapi_base_url = None
 
 # Discord
 _discord_webhook_url = None
-_COLOR_GREEN  = 3066993   # takeoff
-_COLOR_ORANGE = 15127554  # landing
-_COLOR_BLUE   = 3447003   # flight update, initial state airborne
-_COLOR_GRAY   = 9807270   # initial state on ground
+_COLOR_GREEN  = 3066993   # takeoff, airborne
+_COLOR_BLUE   = 3447003   # landing
 
+# List of airports loaded from airports.csv
+_airports = []
 
 @dataclass
 class FlightSnapshot:
@@ -55,14 +65,11 @@ class PlaneState:
 	last_groundspeed: float | None = None
 	last_lat: float | None = None
 	last_lon: float | None = None
-	last_nearest_airport: str | None = None
-	last_nearest_airport_code: str | None = None
-	last_nearest_airport_location: str | None = None
-	last_nearest_airport_elevation_ft: float | None = None
-	last_nearest_airport_lat: float | None = None
-	last_nearest_airport_lon: float | None = None
+	last_airport_code: str | None = None
+	last_airport_location: str | None = None
 	last_state: str = "offline"
 	last_poll_seconds: int | None = None
+	previous_flight_phase: str | None = None
 
 
 def build_tracking_url(icao):
@@ -78,11 +85,34 @@ def format_groundspeed(groundspeed):
 
 
 def format_airport_label(code, location):
-	if not code and not location:
-		return "unknown"
+	if code is None:
+		return None
 	if code and location:
 		return f"{code} ({location})"
-	return code or location
+	return code
+
+
+def set_poll_interval(state):
+	poll_interval = POLL_SECONDS_DEFAULT
+
+	if state.last_state == 'offline':
+		poll_interval = POLL_SECONDS_OFFLINE
+	elif state.last_state == 'on_ground':
+		poll_interval = POLL_SECONDS_ON_GROUND
+	elif state.last_state == 'airborne':
+		if state.last_altitude > POLL_THRESHOLD_ALTITUDE:
+			poll_interval = POLL_SECONDS_ENROUTE_ALTITUDE
+		else:
+			poll_interval = POLL_SECONDS_LOW_ALTITUDE
+
+	if state.last_poll_seconds != poll_interval:
+		state.last_poll_seconds = poll_interval
+		logging.debug(
+			"Polling interval switched to %ss (alt %s, state %s)",
+			poll_interval,
+			format_altitude(state.last_altitude),
+			state.last_state or "unknown",
+		)
 
 
 def haversine_nm(lat1, lon1, lat2, lon2):
@@ -98,7 +128,8 @@ def haversine_nm(lat1, lon1, lat2, lon2):
 
 
 def load_airports():
-	airports = []
+	global _airports
+	_airports = []
 
 	try:
 		with open(AIRPORTS_CSV_LOCAL_PATH, "r", encoding="utf-8") as f:
@@ -116,14 +147,12 @@ def load_airports():
 		try:
 			elevation_ft = int(row.get("elevation_ft"))
 		except (TypeError, ValueError):
-#			logging.warning("Skipping airport with invalid elevation_ft: %r", row)
 			continue
 
 		try:
 			lat = float(row.get("latitude_deg"))
 			lon = float(row.get("longitude_deg"))
 		except (TypeError, ValueError):
-#			logging.warning("Skipping airport with invalid latitude_deg or longitude_deg: %r", row)
 			continue
 
 		code = row.get("icao_code") or row.get("ident") or "UNKNOWN"
@@ -133,7 +162,7 @@ def load_airports():
 		country = row.get("iso_country") if isinstance(row.get("iso_country"), str) else ""
 		location = ", ".join(part for part in [municipality, country] if part) or "unknown location"
 
-		airports.append(
+		_airports.append(
 			{
 				"code": code,
 				"location": location,
@@ -143,25 +172,50 @@ def load_airports():
 			}
 		)
 
-	return airports
+	logging.info("Loaded %d airports for nearest-airport/AGL calculations", len(_airports))
+
+	return
 
 
-def find_nearest_airport(lat, lon, airports):
-	if lat is None or lon is None:
-		return None
-
+def find_airport(lat, lon, altitude):
 	closest = None
 	closest_nm = None
-	for airport in airports:
+
+	for airport in _airports:
 		distance_nm = haversine_nm(lat, lon, airport["lat"], airport["lon"])
 		if closest_nm is None or distance_nm < closest_nm:
 			closest = airport
 			closest_nm = distance_nm
 
-	return closest, closest_nm
+	if closest is None:
+		return None, None
+	if closest_nm is None or closest_nm > NEAR_AIRPORT_NM_THRESHOLD:
+		return None, None
+
+	altitude_agl = 0
+	if altitude > 0:
+		# altitude > 0 means alt_baro is a number, not "ground"
+		altitude_agl = altitude - closest["elevation_ft"]
+	if altitude_agl > NEAR_AIRPORT_AGL_THRESHOLD:
+		return None, None
+
+	logging.debug("Airport: %s (%s) at %.1fnm, alt_agl=%s",
+		closest["code"],
+		closest["location"],
+		closest_nm,
+		format_altitude(altitude_agl),
+	)
+	return closest["code"], closest["location"]
 
 
-def send_discord_embed(embed):
+def send_discord_message(title, color, url=None, fields=None, timestamp=None):
+	embed = {"title": title, "color": color, "footer": {"text": "ADS-B Exchange"}}
+	if url:
+		embed["url"] = url
+	if fields:
+		embed["fields"] = fields
+	if timestamp:
+		embed["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 	payload = json.dumps({"embeds": [embed]}).encode()
 	if not _discord_webhook_url:
 		logging.debug("Discord webhook URL not set; skipping notification: %s", json.dumps(embed, indent=2))
@@ -206,97 +260,52 @@ def send_discord_embed(embed):
 	)
 
 
-def make_embed(title, color, url=None, fields=None, timestamp=None):
-	embed = {"title": title, "color": color, "footer": {"text": "ADS-B Exchange"}}
-	if url:
-		embed["url"] = url
-	if fields:
-		embed["fields"] = fields
-	if timestamp:
-		embed["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-	return embed
+def emit_transition_event(state, transition, timestamp, detection_method):
+	tracking_url = build_tracking_url(state.last_icao)
 
+	# Log the transition no matter what it is.
+	logging.info("%s %s (%s)", transition, detection_method, tracking_url)
 
-def notify_event(title, color, url=None, fields=None, timestamp=None):
-	send_discord_embed(make_embed(title=title, color=color, url=url, fields=fields, timestamp=timestamp))
-
-
-def _field(name, value):
-	return {"name": name, "value": str(value), "inline": True}
-
-
-def emit_transition_event(registration, event_name, tracking_url, airport_label, timestamp, detection_method="confirmed"):
-	logging.info("%s %s (%s)", event_name.lower(), detection_method, tracking_url)
-
-	if event_name not in {"TAKEOFF", "LANDING"}:
+	# The only transitions we send to Discord are TAKEOFF, AIRBORNE, and LANDING.
+	# We'll only send one AIRBORNE per flight and only if we haven't already had a TAKEOFF.
+	if transition == "TAKEOFF":
+		state.previous_flight_phase = "TAKEOFF"
+	elif transition == "AIRBORNE":
+		if state.previous_flight_phase in {"TAKEOFF", "AIRBORNE"}:
+			return
+		state.previous_flight_phase = "AIRBORNE"
+	elif transition == "LANDING":
+		state.previous_flight_phase = "LANDING"
+	else:
 		return
 
+	airport_label = format_airport_label(state.last_airport_code, state.last_airport_location)
+
 	color = _COLOR_GREEN
-	if event_name == "LANDING":
+	if transition == "LANDING":
 		color = _COLOR_BLUE
 
 	fields = []
-	if event_name == "TAKEOFF" and airport_label:
-		fields.append(_field("Departing", airport_label))
-	elif event_name == "LANDING" and airport_label:
-		fields.append(_field("Arriving", airport_label))
-	notify_event(
-		title=f"\u2708\ufe0f {registration} — {event_name}",
+	if transition == "TAKEOFF" and airport_label:
+		fields.append({
+			"name": "Departing",
+			"value": airport_label,
+			"inline": True
+		})
+	elif transition == "LANDING" and airport_label:
+		fields.append({
+			"name": "Arriving",
+			"value": airport_label,
+			"inline": True
+		})
+
+	send_discord_message(
+		title=f"\u2708\ufe0f {state.last_registration} — {transition}",
 		color=color,
 		url=tracking_url,
 		fields=fields or None,
 		timestamp=timestamp,
 	)
-
-
-def set_poll_interval(state):
-	poll_interval = POLL_SECONDS_DEFAULT
-	if state.last_state == 'offline':
-		poll_interval = POLL_SECONDS_OFFLINE
-	elif state.last_state == 'on_ground':
-		poll_interval = POLL_SECONDS_ON_GROUND
-	elif state.last_state == 'airborne':
-		if state.last_altitude > POLL_THRESHOLD_ALTITUDE:
-			poll_interval = POLL_SECONDS_ENROUTE_ALTITUDE
-		else:
-			poll_interval = POLL_SECONDS_LOW_ALTITUDE
-
-	if state.last_poll_seconds != poll_interval:
-		state.last_poll_seconds = poll_interval
-		logging.debug(
-			"Polling interval switched to %ss (alt %s, state %s)",
-			poll_interval,
-			format_altitude(state.last_altitude),
-			state.last_state or "unknown",
-		)
-
-
-def should_assume_takeoff(state):
-	logging.debug("Checking if should assume takeoff: alt_agl=%s, haversine_nm=%s",
-				  state.last_altitude_agl,
-				  haversine_nm(state.last_lat, state.last_lon, state.last_nearest_airport_lat, state.last_nearest_airport_lon)
-				  )
-	if state.last_altitude_agl is None or state.last_altitude_agl > 5000:
-		return False
-	if state.last_lat is None or state.last_lon is None or state.last_nearest_airport_lat is None or state.last_nearest_airport_lon is None:
-		return False
-	if not state.last_nearest_airport_code and not state.last_nearest_airport_location:
-		return False
-	return haversine_nm(state.last_lat, state.last_lon, state.last_nearest_airport_lat, state.last_nearest_airport_lon) <= 5.0
-
-
-def should_assume_landing(state):
-	logging.debug("Checking if should assume landing: alt_agl=%s, haversine_nm=%s",
-				  state.last_altitude_agl,
-				  haversine_nm(state.last_lat, state.last_lon, state.last_nearest_airport_lat, state.last_nearest_airport_lon)
-				  )
-	if state.last_altitude_agl is None or state.last_altitude_agl > 5000:
-		return False
-	if state.last_lat is None or state.last_lon is None or state.last_nearest_airport_lat is None or state.last_nearest_airport_lon is None:
-		return False
-	if not state.last_nearest_airport_code and not state.last_nearest_airport_location:
-		return False
-	return haversine_nm(state.last_lat, state.last_lon, state.last_nearest_airport_lat, state.last_nearest_airport_lon) <= 5.0
 
 
 def process_transition(state, current_state, timestamp):
@@ -314,7 +323,7 @@ def process_transition(state, current_state, timestamp):
 	if current_state == "offline" and state.last_state == "on_ground":
 		transition = "offline"
 	if current_state == "offline" and state.last_state == "airborne":
-		if should_assume_landing(state):
+		if state.last_airport_code is not None:
 			transition = "landing"
 			detection_method = "assumed"
 		else:
@@ -326,7 +335,7 @@ def process_transition(state, current_state, timestamp):
 	if current_state == "airborne" and state.last_state == "on_ground":
 		transition = "takeoff"
 	if current_state == "airborne" and state.last_state == "offline":
-		if should_assume_takeoff(state):
+		if state.last_airport_code is not None:
 			transition = "takeoff"
 			detection_method = "assumed"
 		else:
@@ -337,10 +346,8 @@ def process_transition(state, current_state, timestamp):
 		return
 
 	emit_transition_event(
-		state.last_registration,
+		state,
 		transition.upper(),
-		build_tracking_url(state.last_icao),
-		state.last_nearest_airport,
 		timestamp,
 		detection_method=detection_method,
 	)
@@ -395,6 +402,13 @@ def fetch_snapshot(registration):
 		logging.error("Invalid groundspeed value %r; skipping snapshot", aircraft.get("gs"))
 		return True, None
 
+	try:
+		lat = float(aircraft.get("lat"))
+		lon = float(aircraft.get("lon"))
+	except:
+		logging.error("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
+		return True, None
+
 	altitude = 0
 	is_airborne = False
 	if isinstance(aircraft.get("alt_baro"), str):
@@ -407,15 +421,9 @@ def fetch_snapshot(registration):
 		except:
 			logging.error("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
 			return True, None
-		if altitude > 100.0 and groundspeed > 35.0:
+		# sanity check, sometimes ads-b data is wonky
+		if altitude > 0 and groundspeed > 25.0:
 			is_airborne = True
-
-	try:
-		lat = float(aircraft.get("lat"))
-		lon = float(aircraft.get("lon"))
-	except:
-		logging.error("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
-		return True, None
 
 	return False, FlightSnapshot(
 		registration=aircraft_r,
@@ -429,7 +437,7 @@ def fetch_snapshot(registration):
 	)
 
 
-def monitor_plane(registration, airports):
+def monitor_plane(registration):
 	state = PlaneState()
 
 	while True:
@@ -449,28 +457,11 @@ def monitor_plane(registration, airports):
 				state.last_groundspeed = snapshot.groundspeed
 				state.last_lat = snapshot.lat
 				state.last_lon = snapshot.lon
-
-				state.last_nearest_airport = None
-				state.last_altitude_agl = 0
-				nearest_airport, nearest_airport_nm = find_nearest_airport(snapshot.lat, snapshot.lon, airports)
-				if nearest_airport:
-					state.last_nearest_airport = format_airport_label(nearest_airport["code"], nearest_airport["location"])
-					state.last_nearest_airport_code = nearest_airport["code"]
-					state.last_nearest_airport_location = nearest_airport["location"]
-					state.last_nearest_airport_elevation_ft = nearest_airport["elevation_ft"]
-					state.last_nearest_airport_lat = nearest_airport["lat"]
-					state.last_nearest_airport_lon = nearest_airport["lon"]
-					if snapshot.is_airborne:
-						state.last_altitude_agl = snapshot.altitude - nearest_airport["elevation_ft"]
-					logging.debug(
-						"Nearest: %s (asl=%s, lat=%s, lon=%s), nm=%.2fnm, agl=%s",
-						state.last_nearest_airport_code,
-						state.last_nearest_airport_elevation_ft,
-						state.last_nearest_airport_lat,
-						state.last_nearest_airport_lon,
-						nearest_airport_nm,
-						state.last_altitude_agl,
-					)
+				state.last_airport_code, state.last_airport_location = find_airport(
+					snapshot.lat,
+					snapshot.lon,
+					snapshot.altitude,
+				)
 				current_state = "airborne" if snapshot.is_airborne else "on_ground"
 				current_timestamp = snapshot.timestamp
 
@@ -495,14 +486,6 @@ def main():
 		datefmt="%Y-%m-%d %H:%M:%S",
 	)
 
-	airports = load_airports()
-	logging.info("Loaded %d airports for nearest-airport/AGL calculations", len(airports))
-
-	global _discord_webhook_url
-	_discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-	if not _discord_webhook_url:
-		logging.warning("WEBHOOK_URL not set; Discord notifications disabled")
-
 	global _rapidapi_key, _rapidapi_host, _rapidapi_base_url
 	_rapidapi_key = os.getenv("RAPIDAPI_KEY")
 	if not _rapidapi_key:
@@ -511,8 +494,15 @@ def main():
 	_rapidapi_host = "adsbexchange-com1.p.rapidapi.com"
 	_rapidapi_base_url = "https://adsbexchange-com1.p.rapidapi.com/v2"
 
+	global _discord_webhook_url
+	_discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+	if not _discord_webhook_url:
+		logging.warning("WEBHOOK_URL not set; Discord notifications disabled")
+
+	load_airports()
+
 	logging.info("Starting tracker for tail# %s", registration)
-	monitor_plane(registration, airports)
+	monitor_plane(registration)
 
 
 if __name__ == "__main__":
