@@ -1,6 +1,21 @@
+# FlightAlert Tracker
 #
-# Download the airports.csv file before running this script.
+# Tracks an aircraft by registration number using the ADS-B Exchange API
+# and optionally sends Discord notifications for takeoff and landing events.
+#
+# Before running, you need to:
+#
+# 1) Download the airports.csv file:
 # wget https://ourairports.com/data/airports.csv
+#
+# 2) Set the RAPIDAPI_KEY environment variable:
+# export RAPIDAPI_KEY="your_rapidapi_key"
+#
+# 3) Set the DISCORD_WEBHOOK_URL environment variable:
+# export DISCORD_WEBHOOK_URL="your_discord_webhook_url"
+#
+# NOTE: Discord is optional; if you don't set the webhook URL,
+# the script will still run and log events to stdout.
 #
 import csv
 import io
