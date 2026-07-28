@@ -19,12 +19,12 @@ from urllib.request import Request, urlopen
 AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
 AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
 
-POLL_SECONDS_DEFAULT = 60
 POLL_SECONDS_OFFLINE = 900
 POLL_SECONDS_ON_GROUND = 10
 POLL_SECONDS_LOW_ALTITUDE = 10
 POLL_SECONDS_ENROUTE_ALTITUDE = 300
 POLL_THRESHOLD_ALTITUDE = 10000
+POLL_SECONDS_TO_WAIT_FOR_OFFLINE = 300
 
 # If an aircraft is within this distance and altitude of an airport,
 # we'll consider it "near" that airport.
@@ -43,6 +43,14 @@ _COLOR_BLUE   = 3447003   # landing
 
 # List of airports loaded from airports.csv
 _airports = []
+
+
+logging.basicConfig(
+	level=logging.INFO,
+	format="%(asctime)s %(levelname)s %(message)s",
+	datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 
 @dataclass
 class FlightSnapshot:
@@ -68,8 +76,9 @@ class PlaneState:
 	last_airport_code: str | None = None
 	last_airport_location: str | None = None
 	last_state: str = "offline"
-	last_poll_seconds: int | None = None
-	previous_flight_phase: str | None = None
+	last_state_timestamp: datetime = datetime.now(timezone.utc)
+	last_poll_seconds: int = POLL_SECONDS_OFFLINE
+	previous_flight_phase: str = "landing"
 
 
 def build_tracking_url(icao):
@@ -93,10 +102,12 @@ def format_airport_label(code, location):
 
 
 def set_poll_interval(state):
-	poll_interval = POLL_SECONDS_DEFAULT
+	poll_interval = state.last_poll_seconds
 
 	if state.last_state == 'offline':
-		poll_interval = POLL_SECONDS_OFFLINE
+		time_since_last_state = (datetime.now(timezone.utc) - state.last_state_timestamp).total_seconds()
+		if time_since_last_state >= POLL_SECONDS_TO_WAIT_FOR_OFFLINE:
+			poll_interval = POLL_SECONDS_OFFLINE
 	elif state.last_state == 'on_ground':
 		poll_interval = POLL_SECONDS_ON_GROUND
 	elif state.last_state == 'airborne':
@@ -172,7 +183,7 @@ def load_airports():
 			}
 		)
 
-	logging.info("Loaded %d airports for nearest-airport/AGL calculations", len(_airports))
+	logging.debug("Loaded %d airports for takeoff/landing detection", len(_airports))
 
 	return
 
@@ -251,7 +262,7 @@ def send_discord_message(title, color, url=None, fields=None, timestamp=None):
 			)
 
 		if attempt < max_attempts:
-			logging.info("Retrying Discord webhook post in %ss", retry_delay_seconds)
+			logging.debug("Retrying Discord webhook post in %ss", retry_delay_seconds)
 			time.sleep(retry_delay_seconds)
 
 	logging.error(
@@ -261,38 +272,41 @@ def send_discord_message(title, color, url=None, fields=None, timestamp=None):
 
 
 def emit_transition_event(state, transition, timestamp, detection_method):
+	airport_label = format_airport_label(state.last_airport_code, state.last_airport_location)
 	tracking_url = build_tracking_url(state.last_icao)
 
 	# Log the transition no matter what it is.
-	logging.info("%s %s (%s)", transition, detection_method, tracking_url)
+	log_str = f"{state.last_registration} {transition.title()} ({detection_method})"
+	if airport_label:
+		log_str += f" at {airport_label}"
+	log_str += f" {tracking_url}"
+	logging.info(log_str)
 
 	# The only transitions we send to Discord are TAKEOFF, AIRBORNE, and LANDING.
 	# We'll only send one AIRBORNE per flight and only if we haven't already had a TAKEOFF.
-	if transition == "TAKEOFF":
-		state.previous_flight_phase = "TAKEOFF"
-	elif transition == "AIRBORNE":
-		if state.previous_flight_phase in {"TAKEOFF", "AIRBORNE"}:
+	if transition == "takeoff":
+		state.previous_flight_phase = "takeoff"
+	elif transition == "airborne":
+		if state.previous_flight_phase in {"takeoff", "airborne"}:
 			return
-		state.previous_flight_phase = "AIRBORNE"
-	elif transition == "LANDING":
-		state.previous_flight_phase = "LANDING"
+		state.previous_flight_phase = "airborne"
+	elif transition == "landing":
+		state.previous_flight_phase = "landing"
 	else:
 		return
 
-	airport_label = format_airport_label(state.last_airport_code, state.last_airport_location)
-
 	color = _COLOR_GREEN
-	if transition == "LANDING":
+	if transition == "landing":
 		color = _COLOR_BLUE
 
 	fields = []
-	if transition == "TAKEOFF" and airport_label:
+	if transition == "takeoff" and airport_label:
 		fields.append({
 			"name": "Departing",
 			"value": airport_label,
 			"inline": True
 		})
-	elif transition == "LANDING" and airport_label:
+	elif transition == "landing" and airport_label:
 		fields.append({
 			"name": "Arriving",
 			"value": airport_label,
@@ -317,6 +331,7 @@ def process_transition(state, current_state, timestamp):
 		return
 	if state.last_state == current_state:
 		return
+	state.last_state_timestamp = datetime.now(timezone.utc)
 
 	transition = None
 	detection_method = "confirmed"
@@ -347,7 +362,7 @@ def process_transition(state, current_state, timestamp):
 
 	emit_transition_event(
 		state,
-		transition.upper(),
+		transition,
 		timestamp,
 		detection_method=detection_method,
 	)
@@ -375,7 +390,7 @@ def fetch_snapshot(registration):
 		return False, None
 
 	logging.debug(
-		"tail#=%r icao=%r alt_baro=%r groundspeed=%r lat=%r lon=%r",
+		"registration=%r icao=%r alt_baro=%r groundspeed=%r lat=%r lon=%r",
 		aircraft.get("r"),
 		aircraft.get("hex"),
 		aircraft.get("alt_baro"),
@@ -475,16 +490,10 @@ def monitor_plane(registration):
 
 def main():
 	if len(sys.argv) != 2:
-		raise SystemExit("Usage: python tracker.py <N-NUMBER>")
+		raise SystemExit("Usage: python tracker.py <REGISTRATION>")
 	registration = sys.argv[1].strip().upper()
 	if not registration:
-		raise SystemExit("N-NUMBER argument cannot be empty")
-
-	logging.basicConfig(
-		level=logging.DEBUG,
-		format="%(asctime)s %(levelname)s %(message)s",
-		datefmt="%Y-%m-%d %H:%M:%S",
-	)
+		raise SystemExit("REGISTRATION argument cannot be empty")
 
 	global _rapidapi_key, _rapidapi_host, _rapidapi_base_url
 	_rapidapi_key = os.getenv("RAPIDAPI_KEY")
@@ -497,11 +506,11 @@ def main():
 	global _discord_webhook_url
 	_discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
 	if not _discord_webhook_url:
-		logging.warning("WEBHOOK_URL not set; Discord notifications disabled")
+		logging.warning("DISCORD_WEBHOOK_URL not set; Discord notifications disabled")
 
 	load_airports()
 
-	logging.info("Starting tracker for tail# %s", registration)
+	logging.info("Starting tracker for registration %s", registration)
 	monitor_plane(registration)
 
 
