@@ -44,7 +44,7 @@ POLL_SECONDS_TO_WAIT_FOR_OFFLINE = 300
 # If an aircraft is within this distance and altitude of an airport,
 # we'll consider it "near" that airport.
 NEAR_AIRPORT_NM_THRESHOLD = 5.0
-NEAR_AIRPORT_AGL_THRESHOLD = 5000
+NEAR_AIRPORT_AGL_THRESHOLD = 2000
 
 # RapidAPI
 _rapidapi_key = None
@@ -61,7 +61,7 @@ _airports = []
 
 
 logging.basicConfig(
-	level=logging.INFO,
+	level=logging.DEBUG,
 	format="%(asctime)s %(levelname)s %(message)s",
 	datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -71,10 +71,13 @@ logging.basicConfig(
 class FlightSnapshot:
 	registration: str
 	icao: str
+	squawk: str | None
+	emergency: str | None
 	altitude: int | None
 	groundspeed: float | None
 	lat: float | None
 	lon: float | None
+	track: float | None
 	is_airborne: bool
 	timestamp: datetime
 
@@ -213,17 +216,13 @@ def find_airport(lat, lon, altitude):
 			closest = airport
 			closest_nm = distance_nm
 
-	if closest is None:
-		return None, None
-	if closest_nm is None or closest_nm > NEAR_AIRPORT_NM_THRESHOLD:
+	if closest is None or closest_nm is None:
 		return None, None
 
 	altitude_agl = 0
 	if altitude > 0:
 		# altitude > 0 means alt_baro is a number, not "ground"
 		altitude_agl = altitude - closest["elevation_ft"]
-	if altitude_agl > NEAR_AIRPORT_AGL_THRESHOLD:
-		return None, None
 
 	logging.debug("Airport: %s (%s) at %.1fnm, alt_agl=%s",
 		closest["code"],
@@ -231,6 +230,15 @@ def find_airport(lat, lon, altitude):
 		closest_nm,
 		format_altitude(altitude_agl),
 	)
+
+	if altitude_agl > NEAR_AIRPORT_AGL_THRESHOLD:
+		return None, None
+
+	if closest_nm > NEAR_AIRPORT_NM_THRESHOLD:
+		return None, None
+
+	logging.debug("Aircraft is near airport %s (%s)", closest["code"], closest["location"])
+
 	return closest["code"], closest["location"]
 
 
@@ -414,54 +422,71 @@ def fetch_snapshot(registration):
 		aircraft.get("lon"),
 	)
 
+	#logging.debug("Raw aircraft data: %s", json.dumps(aircraft, indent=2))
+
 	if isinstance(aircraft.get("r"), str) and aircraft.get("r").strip():
 		aircraft_r = aircraft.get("r").strip().upper()
 	else:
-		logging.error("Invalid registration value %r; skipping snapshot", aircraft.get("r"))
+		logging.debug("Invalid registration value %r; skipping snapshot", aircraft.get("r"))
 		return True, None
 
 	if isinstance(aircraft.get("hex"), str) and aircraft.get("hex").strip():
 		icao = aircraft.get("hex").strip().upper()
 	else:
-		logging.error("Invalid ICAO value %r; skipping snapshot", aircraft.get("hex"))
+		logging.debug("Invalid ICAO value %r; skipping snapshot", aircraft.get("hex"))
 		return True, None
 
 	try:
 		groundspeed = float(aircraft.get("gs"))
 	except:
-		logging.error("Invalid groundspeed value %r; skipping snapshot", aircraft.get("gs"))
+		logging.debug("Invalid groundspeed value %r; skipping snapshot", aircraft.get("gs"))
 		return True, None
 
 	try:
 		lat = float(aircraft.get("lat"))
 		lon = float(aircraft.get("lon"))
 	except:
-		logging.error("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
+		logging.debug("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
 		return True, None
 
 	altitude = 0
 	is_airborne = False
 	if isinstance(aircraft.get("alt_baro"), str):
 		if aircraft.get("alt_baro").strip().lower() != "ground":
-			logging.error("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
+			logging.debug("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
 			return True, None
 	else:
 		try:
 			altitude = round(aircraft.get("alt_baro"))
 		except:
-			logging.error("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
+			logging.debug("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
 			return True, None
 		# sanity check, sometimes ads-b data is wonky
 		if altitude > 0 and groundspeed > 25.0:
 			is_airborne = True
 
+	track = None
+	if isinstance(aircraft.get("track"), (int, float)):
+		track = float(aircraft.get("track"))
+
+	squawk = None
+	if isinstance(aircraft.get("squawk"), str):
+		squawk = aircraft.get("squawk").strip()
+
+	emergency = None
+	if isinstance(aircraft.get("emergency"), str):
+		emergency = aircraft.get("emergency").strip().lower()
+
 	return False, FlightSnapshot(
 		registration=aircraft_r,
 		icao=icao,
+		squawk=squawk,
+		emergency=emergency,
 		altitude=altitude,
 		groundspeed=groundspeed,
 		lat=lat,
 		lon=lon,
+		track=track,
 		is_airborne=is_airborne,
 		timestamp=datetime.now(timezone.utc),
 	)
