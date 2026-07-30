@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
@@ -360,16 +360,22 @@ def get_new_flight_phase(transition, last_flight_phase):
 		return transition
 	if transition == "airborne" and last_flight_phase == "landing":
 		return transition
-	# no change in flight phase
+	# No change in flight phase.
 	return None
 
 
 def is_airborne(last_state, altitude, groundspeed):
 	if altitude is None:
+		# Aircraft is on the ground (alt_baro is "ground").
 		return False
 	if last_state == "airborne":
+		# alt_baro is not "ground" and last state was airborne.
+		# Confidence is high aircraft is airborne.
 		return True
 	if altitude > 0 and groundspeed > 25.0:
+		# alt_baro is not "ground" but we need to guard against fluttering
+		# where aircraft is actually on the ground but sending wonky data.
+		# This basic sanity check helps prevent false takeoff/landing events.
 		return True
 	return False
 
@@ -403,8 +409,6 @@ def fetch_snapshot(registration):
 		aircraft.get("lon"),
 	)
 
-	#logging.debug("Raw aircraft data: %s", json.dumps(aircraft, indent=2))
-
 	if isinstance(aircraft.get("r"), str) and aircraft.get("r").strip():
 		aircraft_r = aircraft.get("r").strip().upper()
 	else:
@@ -430,7 +434,7 @@ def fetch_snapshot(registration):
 		logging.debug("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
 		return True, None
 
-	# if altitude is None, aircraft is on the ground.
+	# If altitude is None, aircraft is on the ground.
 	altitude = None
 	if isinstance(aircraft.get("alt_baro"), str):
 		if aircraft.get("alt_baro").strip().lower() == "ground":
@@ -490,6 +494,7 @@ def monitor_plane(registration):
 					current_state = "offline"
 			else:
 				# Aircraft is online, update the state with the latest snapshot.
+				state.last_state_timestamp = datetime.now(timezone.utc)
 				state.last_registration = snapshot.registration
 				state.last_icao = snapshot.icao
 				state.last_altitude = snapshot.altitude
@@ -514,7 +519,6 @@ def monitor_plane(registration):
 					current_state = "on_ground"
 
 			if state.last_state != current_state:
-
 				# If the state has changed, determine the transition type.
 				transition, detection_method = get_transition(
 					last_state=state.last_state,
@@ -541,7 +545,6 @@ def monitor_plane(registration):
 
 				# Update the state.
 				state.last_state = current_state
-				state.last_state_timestamp = datetime.now(timezone.utc)
 
 		state.last_poll_seconds = get_poll_interval(
 			last_state=state.last_state,
