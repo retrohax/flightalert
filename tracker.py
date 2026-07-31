@@ -121,31 +121,20 @@ def format_airport_label(code, location):
 	return code
 
 
-def get_poll_interval(last_state, last_altitude, last_poll_seconds):
-	poll_interval = last_poll_seconds
-
+def get_poll_interval(last_state, last_altitude):
 	if last_state == 'offline':
-		poll_interval = POLL_SECONDS_OFFLINE
-	elif last_state == 'on_ground':
-		poll_interval = POLL_SECONDS_ON_GROUND
-	elif last_state == 'airborne':
+		return POLL_SECONDS_OFFLINE
+	if last_state == 'on_ground':
+		return POLL_SECONDS_ON_GROUND
+	if last_state == 'airborne':
 		if last_altitude > POLL_THRESHOLD_ALTITUDE_BC:
-			poll_interval = POLL_SECONDS_ALTITUDE_C
+			return POLL_SECONDS_ALTITUDE_C
 		elif last_altitude > POLL_THRESHOLD_ALTITUDE_AB:
-			poll_interval = POLL_SECONDS_ALTITUDE_B
+			return POLL_SECONDS_ALTITUDE_B
 		else:
-			poll_interval = POLL_SECONDS_ALTITUDE_A
-
-	if last_poll_seconds != poll_interval:
-		last_poll_seconds = poll_interval
-		logging.debug(
-			"Polling interval switched to %ss (alt %s, state %s)",
-			poll_interval,
-			format_altitude(last_altitude),
-			last_state or "unknown",
-		)
-
-	return poll_interval
+			return POLL_SECONDS_ALTITUDE_A
+	# Should never reach here.
+	return POLL_SECONDS_OFFLINE
 
 
 def haversine_nm(lat1, lon1, lat2, lon2):
@@ -508,24 +497,20 @@ def monitor_plane(registration):
 				state.last_lat = snapshot.lat
 				state.last_lon = snapshot.lon
 
-				# See if the aircraft is near an airport.
+				# See if aircraft is near an airport.
 				state.last_airport_code, state.last_airport_location = find_airport(
 					snapshot.lat,
 					snapshot.lon,
 					snapshot.altitude,
 				)
 
-				if is_airborne(
-					last_state=state.last_state,
-					altitude=snapshot.altitude,
-					groundspeed=snapshot.groundspeed
-				):
+				if is_airborne(state.last_state, snapshot.altitude, snapshot.groundspeed):
 					current_state = "airborne"
 				else:
 					current_state = "on_ground"
 
 			if state.last_state != current_state:
-				# If the state has changed, determine the transition type.
+				# State has changed, determine the transition type.
 				transition, detection_method = get_transition(
 					last_state=state.last_state,
 					current_state=current_state,
@@ -552,11 +537,15 @@ def monitor_plane(registration):
 				# Update the state.
 				state.last_state = current_state
 
-		state.last_poll_seconds = get_poll_interval(
-			last_state=state.last_state,
-			last_altitude=state.last_altitude,
-			last_poll_seconds=state.last_poll_seconds
-		)
+		poll_interval = get_poll_interval(state.last_state, state.last_altitude)
+		if state.last_poll_seconds != poll_interval:
+			state.last_poll_seconds = poll_interval
+			logging.debug(
+				"Polling interval switched to %ss (alt %s, state %s)",
+				poll_interval,
+				format_altitude(state.last_altitude),
+				state.last_state,
+			)
 		logging.debug("Sleeping for %s before next poll", state.last_poll_seconds)
 		time.sleep(state.last_poll_seconds)
 
