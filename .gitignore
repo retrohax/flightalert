@@ -35,6 +35,7 @@ Thumbs.db
 *.swo
 
 # Project-specific runtime artifacts
+*.pid
 *.log
 *.sav
 notes.txt
