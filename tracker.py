@@ -34,15 +34,19 @@ from urllib.request import Request, urlopen
 AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
 AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
 
+# We only get 10,000 api requests per month so we limit the polling
+# frequency where we can without losing transition detection accuracy.
 POLL_SECONDS_OFFLINE = 900
-POLL_SECONDS_ON_GROUND = 10
-POLL_SECONDS_LOW_ALTITUDE = 10
-POLL_SECONDS_ENROUTE_ALTITUDE = 300
-POLL_THRESHOLD_ALTITUDE = 10000
+POLL_SECONDS_ON_GROUND = 30
+POLL_SECONDS_ALTITUDE_A = 15
+POLL_SECONDS_ALTITUDE_B = 300
+POLL_SECONDS_ALTITUDE_C = 900
+POLL_THRESHOLD_ALTITUDE_AB = 10000
+POLL_THRESHOLD_ALTITUDE_BC = 30000
 SECONDS_TO_WAIT_FOR_OFFLINE = 300
 
 # If an aircraft is within this distance and altitude of an airport,
-# we'll consider it "near" that airport.
+# we consider it "near" that airport.
 NEAR_AIRPORT_NM_THRESHOLD = 5.0
 NEAR_AIRPORT_AGL_THRESHOLD = 2000
 
@@ -125,10 +129,12 @@ def get_poll_interval(last_state, last_altitude, last_poll_seconds):
 	elif last_state == 'on_ground':
 		poll_interval = POLL_SECONDS_ON_GROUND
 	elif last_state == 'airborne':
-		if last_altitude > POLL_THRESHOLD_ALTITUDE:
-			poll_interval = POLL_SECONDS_ENROUTE_ALTITUDE
+		if last_altitude > POLL_THRESHOLD_ALTITUDE_BC:
+			poll_interval = POLL_SECONDS_ALTITUDE_C
+		elif last_altitude > POLL_THRESHOLD_ALTITUDE_AB:
+			poll_interval = POLL_SECONDS_ALTITUDE_B
 		else:
-			poll_interval = POLL_SECONDS_LOW_ALTITUDE
+			poll_interval = POLL_SECONDS_ALTITUDE_A
 
 	if last_poll_seconds != poll_interval:
 		last_poll_seconds = poll_interval
