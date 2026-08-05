@@ -25,7 +25,7 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -38,12 +38,21 @@ AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
 # frequency where we can without losing transition detection accuracy.
 POLL_SECONDS_OFFLINE = 900
 POLL_SECONDS_ON_GROUND = 30
-POLL_SECONDS_ALTITUDE_A = 15
+POLL_SECONDS_NEAR_AIRPORT = 20
+POLL_SECONDS_ALTITUDE_A = 60
 POLL_SECONDS_ALTITUDE_B = 300
 POLL_SECONDS_ALTITUDE_C = 900
+POLL_INTERVAL_INCREMENT = 60
 POLL_THRESHOLD_ALTITUDE_AB = 10000
 POLL_THRESHOLD_ALTITUDE_BC = 30000
-SECONDS_TO_WAIT_FOR_OFFLINE = 1800
+
+# The "airborne" aircraft has been offline too long, reset it to "on_ground".
+WAIT_FOR_RESET_ENROUTE = 24*3600
+# The "airborne" aircraft was near an airport and has been offline too long,
+# reset it to "on_ground". This will force a landing event.
+WAIT_FOR_RESET_NEAR_AIRPORT = 300
+# The aircraft was "on_ground" and has been offline too long, change polling interval.
+WAIT_FOR_OFFLINE = 3600
 
 # If an aircraft is within this distance and altitude of an airport,
 # we consider it "near" that airport.
@@ -82,6 +91,9 @@ class FlightSnapshot:
 	lat: float | None
 	lon: float | None
 	track: float | None
+	airport_code: str | None = None
+	airport_location: str | None = None
+	altitude_agl: int | None = None
 
 
 @dataclass
@@ -95,10 +107,10 @@ class PlaneState:
 	last_lon: float | None = None
 	last_airport_code: str | None = None
 	last_airport_location: str | None = None
-	last_state: str = "offline"
-	last_state_timestamp: datetime = datetime.now(timezone.utc)
-	last_poll_seconds: int = POLL_SECONDS_OFFLINE
-	last_flight_phase: str = "landing"
+	last_altitude_agl: int | None = None
+	last_status: str = "on_ground"
+	last_poll_seconds: int = 0
+	last_contact: datetime = field(default_factory=lambda: datetime.fromtimestamp(0, timezone.utc))
 
 
 def build_tracking_url(icao):
@@ -121,32 +133,34 @@ def format_airport_label(code, location):
 	return code
 
 
-def get_poll_interval(last_state, last_altitude):
-	if last_state == 'offline':
-		return POLL_SECONDS_OFFLINE
-	if last_state == 'on_ground':
+def time_since(start_time):
+	return (datetime.now(timezone.utc) - start_time).total_seconds()
+
+
+def normalize_poll_interval(seconds):
+	# Round up to the nearest multiple of 60 seconds.
+	return seconds + (60 - seconds % 60) if seconds % 60 != 0 else seconds
+
+
+def get_poll_interval(status, altitude, is_near_airport, last_contact, last_poll_seconds):
+	if status == 'on_ground':
+		if time_since(last_contact) >= WAIT_FOR_OFFLINE:
+			return POLL_SECONDS_OFFLINE
 		return POLL_SECONDS_ON_GROUND
-	if last_state == 'airborne':
-		if last_altitude > POLL_THRESHOLD_ALTITUDE_BC:
+	if status == 'airborne':
+		if is_near_airport:
+			return POLL_SECONDS_NEAR_AIRPORT
+		seconds = normalize_poll_interval(last_poll_seconds)
+		next_poll_interval = seconds + POLL_INTERVAL_INCREMENT
+		if time_since(last_contact) >= next_poll_interval:
+			return min(next_poll_interval, POLL_SECONDS_OFFLINE)
+		if altitude > POLL_THRESHOLD_ALTITUDE_BC:
 			return POLL_SECONDS_ALTITUDE_C
-		elif last_altitude > POLL_THRESHOLD_ALTITUDE_AB:
+		if altitude > POLL_THRESHOLD_ALTITUDE_AB:
 			return POLL_SECONDS_ALTITUDE_B
-		else:
-			return POLL_SECONDS_ALTITUDE_A
+		return POLL_SECONDS_ALTITUDE_A
 	# Should never reach here.
 	return POLL_SECONDS_OFFLINE
-
-
-def haversine_nm(lat1, lon1, lat2, lon2):
-	# Great-circle distance in nautical miles.
-	r = 3440.065
-	phi1 = math.radians(lat1)
-	phi2 = math.radians(lat2)
-	dphi = math.radians(lat2 - lat1)
-	dlambda = math.radians(lon2 - lon1)
-	a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-	c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-	return r * c
 
 
 def load_airports():
@@ -199,7 +213,19 @@ def load_airports():
 	return
 
 
-def find_airport(lat, lon, altitude):
+def haversine_nm(lat1, lon1, lat2, lon2):
+	# Great-circle distance in nautical miles.
+	r = 3440.065
+	phi1 = math.radians(lat1)
+	phi2 = math.radians(lat2)
+	dphi = math.radians(lat2 - lat1)
+	dlambda = math.radians(lon2 - lon1)
+	a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+	c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+	return r * c
+
+
+def find_nearest_airport(lat, lon):
 	closest = None
 	closest_nm = None
 
@@ -212,24 +238,7 @@ def find_airport(lat, lon, altitude):
 	if closest is None or closest_nm is None:
 		return None, None
 
-	altitude_agl = 0
-	if altitude is not None:
-		altitude_agl = altitude - closest["elevation_ft"]
-
-	if altitude_agl > NEAR_AIRPORT_AGL_THRESHOLD:
-		return None, None
-
-	if closest_nm > NEAR_AIRPORT_NM_THRESHOLD:
-		return None, None
-
-	logging.debug("Airport: %s (%s) at %.1fnm, alt_agl=%s",
-		closest["code"],
-		closest["location"],
-		closest_nm,
-		format_altitude(altitude_agl),
-	)
-
-	return closest["code"], closest["location"]
+	return closest, closest_nm
 
 
 def send_discord_message(title, color, url=None, fields=None, timestamp=None):
@@ -284,21 +293,25 @@ def send_discord_message(title, color, url=None, fields=None, timestamp=None):
 	)
 
 
-def emit_transition_event(registration, airport_label, tracking_url, transition, detection_method, send_to_discord):
-	# Log the transition no matter what it is.
-	log_str = f"{registration} {transition.title()} ({detection_method})"
+def emit_transition_event(registration, airport_code, airport_location, icao, transition):
+	if transition is None:
+		logging.debug("No transition event to emit for %s", registration)
+		return
+
+	airport_label = format_airport_label(airport_code, airport_location)
+	tracking_url = build_tracking_url(icao)
+
+	# Log the transition.
+	log_str = f"{registration} {transition.title()}"
 	if airport_label:
 		log_str += f" at {airport_label}"
 	log_str += f" {tracking_url}"
 	logging.info(log_str)
 
-	if not send_to_discord:
-		return
-
+	# Send it to Discord.
 	color = _COLOR_GREEN
 	if transition == "landing":
 		color = _COLOR_BLUE
-
 	fields = []
 	if transition == "takeoff" and airport_label:
 		fields.append({
@@ -312,7 +325,6 @@ def emit_transition_event(registration, airport_label, tracking_url, transition,
 			"value": airport_label,
 			"inline": True
 		})
-
 	send_discord_message(
 		title=f"\u2708\ufe0f {registration} {transition.title()}",
 		color=color,
@@ -322,55 +334,20 @@ def emit_transition_event(registration, airport_label, tracking_url, transition,
 	)
 
 
-def get_transition(last_state, current_state, is_near_airport):
-	transition =  "undefined"
-	detection_method = "confirmed"
-
-	if current_state == "offline" and last_state == "on_ground":
-		transition = "offline"
-	if current_state == "offline" and last_state == "airborne":
-		if is_near_airport:
-			transition = "landing"
-			detection_method = "assumed"
-		else:
-			transition = "offline"
-	if current_state == "on_ground" and last_state == "airborne":
-		transition = "landing"
-	if current_state == "on_ground" and last_state == "offline":
-		transition = "online"
-	if current_state == "airborne" and last_state == "on_ground":
-		transition = "takeoff"
-	if current_state == "airborne" and last_state == "offline":
-		if is_near_airport:
-			transition = "takeoff"
-			detection_method = "assumed"
-		else:
-			transition = "airborne"
-
-	return transition, detection_method
-
-
-def get_new_flight_phase(transition, last_flight_phase):
-	if transition in ("takeoff", "landing"):
-		return transition
-	if transition == "airborne" and last_flight_phase == "landing":
-		return transition
-	# No change in flight phase.
+def get_transition(current_status, is_near_airport):
+	if current_status == "airborne":
+		return "takeoff" if is_near_airport else "airborne"
+	if current_status == "on_ground":
+		return "landing" if is_near_airport else "reset"
+	# Should never reach here.
 	return None
 
 
-def is_airborne(last_state, altitude, groundspeed):
-	if altitude is None:
-		# Aircraft is on the ground (alt_baro is "ground").
-		return False
-	if last_state == "airborne":
-		# alt_baro is not "ground" and last state was airborne.
-		# Confidence is high aircraft is airborne.
-		return True
-	if altitude > 0 and groundspeed > 25.0:
-		# alt_baro is not "ground" but we need to guard against fluttering
-		# where aircraft is actually on the ground but sending wonky data.
-		# This basic sanity check helps prevent false takeoff/landing events.
+def is_airborne(altitude_agl, groundspeed):
+	if altitude_agl > 100 and groundspeed > 25.0:
+		# We need to guard against fluttering where aircraft is actually
+		# on the ground but sending wonky data. This basic sanity check
+		# helps prevent false takeoff/landing events.
 		return True
 	return False
 
@@ -395,10 +372,11 @@ def fetch_snapshot(registration):
 		return False, None
 
 	logging.debug(
-		"registration=%r icao=%r alt_baro=%r groundspeed=%r lat=%r lon=%r track=%r squawk=%r emergency=%r",
+		"registration=%r icao=%r alt_baro=%r alt_geom=%r groundspeed=%r lat=%r lon=%r track=%r squawk=%r emergency=%r",
 		aircraft.get("r"),
 		aircraft.get("hex"),
 		aircraft.get("alt_baro"),
+		aircraft.get("alt_geom"),
 		aircraft.get("gs"),
 		aircraft.get("lat"),
 		aircraft.get("lon"),
@@ -432,7 +410,6 @@ def fetch_snapshot(registration):
 		logging.debug("Invalid lat/lon values %r/%r; skipping snapshot", aircraft.get("lat"), aircraft.get("lon"))
 		return True, None
 
-	# If altitude is None, aircraft is on the ground.
 	altitude = None
 	if isinstance(aircraft.get("alt_baro"), str):
 		if aircraft.get("alt_baro").strip().lower() == "ground":
@@ -446,6 +423,45 @@ def fetch_snapshot(registration):
 		except:
 			logging.debug("invalid alt_baro value %r; skipping snapshot", aircraft.get("alt_baro"))
 			return True, None
+	if altitude is not None:
+		# See if we can upgrade from alt_baro to alt_geom if available.
+		if isinstance(aircraft.get("alt_geom"), (int, float)):
+			altitude = round(aircraft.get("alt_geom"))
+
+	altitude_agl = None
+	airport, airport_nm = find_nearest_airport(lat, lon)
+	if airport is not None and airport_nm is not None:
+		altitude_agl = 0
+		if altitude is None:
+			# alt_baro is "ground", aircraft is on the ground.
+			pass
+		else:
+			altitude_agl = max(altitude - airport["elevation_ft"], 0)
+
+	if altitude_agl is None:
+		logging.debug("Cannot determine nearest airport; skipping snapshot")
+		return True, None
+
+	airport_code = None
+	airport_location = None
+	if airport is None or airport_nm is None:
+		pass
+	elif altitude_agl > NEAR_AIRPORT_AGL_THRESHOLD:
+		pass
+	elif airport_nm > NEAR_AIRPORT_NM_THRESHOLD:
+		pass
+	else:
+		airport_code = airport["code"]
+		airport_location = airport["location"]
+
+	logging.debug(
+		"Nearest airport: %s (%s) at %.1fnm, alt_agl=%s, is_near_airport=%s",
+		airport["code"],
+		airport["location"],
+		airport_nm,
+		format_altitude(altitude_agl),
+		airport_code is not None
+	)
 
 	track = None
 	if isinstance(aircraft.get("track"), (int, float)):
@@ -469,88 +485,86 @@ def fetch_snapshot(registration):
 		lat=lat,
 		lon=lon,
 		track=track,
+		airport_code=airport_code,
+		airport_location=airport_location,
+		altitude_agl=altitude_agl
 	)
 
 
 def monitor_plane(registration):
-	state = PlaneState()
+	plane_state = PlaneState()
 
 	while True:
 		# Fetch the latest snapshot of the aircraft's state.
 		invalid_response, snapshot = fetch_snapshot(registration)
-		current_state = state.last_state
+		current_status = plane_state.last_status
 
 		if snapshot is None:
-			# Aircraft is offline. Give it some time though, we don't want to
-			# trigger a transition if it was just a temporary loss of signal.
-			time_since_last_state = (datetime.now(timezone.utc) - state.last_state_timestamp).total_seconds()
-			if time_since_last_state >= SECONDS_TO_WAIT_FOR_OFFLINE:
-				current_state = "offline"
+			# Aircraft is offline.
+			if plane_state.last_status == "airborne":
+				if plane_state.last_airport_code is not None:
+					if time_since(plane_state.last_contact) >= WAIT_FOR_RESET_NEAR_AIRPORT:
+						current_status = "on_ground"
+				else:
+					if time_since(plane_state.last_contact) >= WAIT_FOR_RESET_ENROUTE:
+						current_status = "on_ground"
 		else:
 			# Aircraft is online.
-			state.last_state_timestamp = datetime.now(timezone.utc)
+			plane_state.last_contact = datetime.now(timezone.utc)
 			if invalid_response:
 				pass
 			else:
-				# Update the state with the latest snapshot.
-				state.last_registration = snapshot.registration
-				state.last_icao = snapshot.icao
-				state.last_altitude = snapshot.altitude
-				state.last_groundspeed = snapshot.groundspeed
-				state.last_lat = snapshot.lat
-				state.last_lon = snapshot.lon
-
-				# See if aircraft is near an airport.
-				state.last_airport_code, state.last_airport_location = find_airport(
-					snapshot.lat,
-					snapshot.lon,
-					snapshot.altitude,
-				)
-
-				if is_airborne(state.last_state, snapshot.altitude, snapshot.groundspeed):
-					current_state = "airborne"
+				plane_state.last_registration = snapshot.registration
+				plane_state.last_icao = snapshot.icao
+				plane_state.last_altitude = snapshot.altitude
+				plane_state.last_groundspeed = snapshot.groundspeed
+				plane_state.last_lat = snapshot.lat
+				plane_state.last_lon = snapshot.lon
+				plane_state.last_airport_code = snapshot.airport_code
+				plane_state.last_airport_location = snapshot.airport_location
+				plane_state.last_altitude_agl = snapshot.altitude_agl
+				if is_airborne(snapshot.altitude_agl, snapshot.groundspeed):
+					current_status = "airborne"
 				else:
-					current_state = "on_ground"
+					current_status = "on_ground"
 
-		if state.last_state != current_state:
-			# State has changed, determine the transition type.
-			transition, detection_method = get_transition(
-				last_state=state.last_state,
-				current_state=current_state,
-				is_near_airport=state.last_airport_code is not None
+		if plane_state.last_status != current_status:
+			# Status has changed, determine the transition type and emit an event.
+			logging.debug("Status changed from %s to %s", plane_state.last_status, current_status)
+			transition = get_transition(
+				current_status=current_status,
+				is_near_airport=plane_state.last_airport_code is not None,
 			)
-
-			# Use the transition type to determine if the flight phase has changed.
-			new_flight_phase = get_new_flight_phase(transition, state.last_flight_phase)
-			if new_flight_phase is not None:
-				state.last_flight_phase = new_flight_phase
-
-			# Emit a transition event:
-			# 1. log the transition
-			# 2. send a discord message if the flight phase changed
 			emit_transition_event(
-				registration=state.last_registration,
-				airport_label=format_airport_label(state.last_airport_code, state.last_airport_location),
-				tracking_url=build_tracking_url(state.last_icao),
-				transition=transition,
-				detection_method=detection_method,
-				send_to_discord=new_flight_phase is not None
+				registration=plane_state.last_registration,
+				airport_code=plane_state.last_airport_code,
+				airport_location=plane_state.last_airport_location,
+				icao=plane_state.last_icao,
+				transition=transition
 			)
+			# Update the status.
+			plane_state.last_status = current_status
 
-			# Update the state.
-			state.last_state = current_state
-
-		poll_interval = get_poll_interval(state.last_state, state.last_altitude)
-		if state.last_poll_seconds != poll_interval:
-			state.last_poll_seconds = poll_interval
+		# Plane state is now fully updated based on the latest snapshot.
+		# Set the next polling interval based on the plane's current status.
+		poll_seconds = get_poll_interval(
+			plane_state.last_status,
+			plane_state.last_altitude_agl or plane_state.last_altitude or 0,
+			plane_state.last_airport_code is not None,
+			plane_state.last_contact,
+			plane_state.last_poll_seconds
+		)
+		if plane_state.last_poll_seconds != poll_seconds:
+			plane_state.last_poll_seconds = poll_seconds
 			logging.debug(
-				"Polling interval switched to %ss (alt %s, state %s)",
-				poll_interval,
-				format_altitude(state.last_altitude),
-				state.last_state,
+				"Polling interval switched to %s (alt %s, agl %s, state %s)",
+				poll_seconds,
+				format_altitude(plane_state.last_altitude),
+				format_altitude(plane_state.last_altitude_agl),
+				plane_state.last_status
 			)
-		logging.debug("Sleeping for %s before next poll", state.last_poll_seconds)
-		time.sleep(state.last_poll_seconds)
+		logging.debug("Sleeping for %s before next poll", plane_state.last_poll_seconds)
+		time.sleep(plane_state.last_poll_seconds)
 
 
 def main():
