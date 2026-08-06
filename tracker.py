@@ -72,6 +72,9 @@ _COLOR_BLUE   = 3447003   # landing
 # List of airports loaded from airports.csv
 _airports = []
 
+# Useful when starting mid-flight to avoid emitting an airborne event.
+_suppress_first_event = False
+
 
 logging.basicConfig(
 	level=logging.DEBUG,
@@ -308,6 +311,12 @@ def emit_transition_event(registration, airport_code, airport_location, icao, tr
 	log_str += f" {tracking_url}"
 	logging.info(log_str)
 
+	global _suppress_first_event
+	if _suppress_first_event:
+		logging.debug("Suppressing %s transition event", transition)
+		_suppress_first_event = False
+		return
+
 	# Send it to Discord.
 	color = _COLOR_GREEN
 	if transition == "landing":
@@ -343,11 +352,11 @@ def get_transition(current_status, is_near_airport):
 	return None
 
 
-def is_airborne(altitude_agl, groundspeed):
-	if altitude_agl > 100 and groundspeed > 25.0:
-		# We need to guard against fluttering where aircraft is actually
-		# on the ground but sending wonky data. This basic sanity check
-		# helps prevent false takeoff/landing events.
+def is_airborne(altitude, groundspeed):
+	# We need to guard against fluttering where aircraft is actually
+	# on the ground but sending wonky data. This basic sanity check
+	# helps prevent false takeoff/landing events.
+	if altitude > 25 and groundspeed > 25.0:
 		return True
 	return False
 
@@ -362,8 +371,23 @@ def fetch_snapshot(registration):
 	try:
 		with urlopen(request, timeout=20) as response:
 			payload = json.load(response)
-	except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-		logging.error("Failed to fetch snapshot")
+	except HTTPError as exc:
+		logging.error("Failed to fetch snapshot for %s: HTTP %s %s", registration, exc.code, exc.reason)
+		return True, None
+	except URLError as exc:
+		reason = getattr(exc, "reason", str(exc))
+		logging.error("Failed to fetch snapshot for %s: network error: %s", registration, reason)
+		return True, None
+	except TimeoutError:
+		logging.error("Failed to fetch snapshot for %s: request timed out", registration)
+		return True, None
+	except json.JSONDecodeError as exc:
+		logging.error(
+			"Failed to fetch snapshot for %s: invalid JSON at line %s column %s",
+			registration,
+			exc.lineno,
+			exc.colno,
+		)
 		return True, None
 
 	aircraft = payload.get("ac")[0] if payload.get("ac") else None
@@ -455,10 +479,11 @@ def fetch_snapshot(registration):
 		airport_location = airport["location"]
 
 	logging.debug(
-		"Nearest airport: %s (%s) at %.1fnm, alt_agl=%s, is_near_airport=%s",
+		"Nearest airport: %s (%s) at %.1fnm, alt=%s, alt_agl=%s, is_near_airport=%s",
 		airport["code"],
 		airport["location"],
 		airport_nm,
+		format_altitude(altitude),
 		format_altitude(altitude_agl),
 		airport_code is not None
 	)
@@ -549,7 +574,7 @@ def monitor_plane(registration):
 		# Set the next polling interval based on the plane's current status.
 		poll_seconds = get_poll_interval(
 			plane_state.last_status,
-			plane_state.last_altitude_agl or plane_state.last_altitude or 0,
+			plane_state.last_altitude_agl,
 			plane_state.last_airport_code is not None,
 			plane_state.last_contact,
 			plane_state.last_poll_seconds
@@ -568,8 +593,8 @@ def monitor_plane(registration):
 
 
 def main():
-	if len(sys.argv) != 2:
-		raise SystemExit("Usage: python tracker.py <REGISTRATION>")
+	if len(sys.argv) < 2:
+		raise SystemExit("Usage: python tracker.py <REGISTRATION> [--suppress-first-event]")
 	registration = sys.argv[1].strip().upper()
 	if not registration:
 		raise SystemExit("REGISTRATION argument cannot be empty")
@@ -590,6 +615,11 @@ def main():
 	load_airports()
 
 	logging.info("Starting tracker for registration %s", registration)
+	if len(sys.argv) >= 3 and sys.argv[2].strip().lower() == "--suppress-first-event":
+		global _suppress_first_event
+		_suppress_first_event = True
+		logging.info("The first transition event will be suppressed")
+	
 	monitor_plane(registration)
 
 
