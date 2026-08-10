@@ -18,12 +18,25 @@ class AirportInfo:
 	elevation_ft: int
 
 
+class AirportSearchStatus(str, Enum):
+	SKIPPED = "skipped"
+	NOT_FOUND = "not_found"
+	FOUND = "found"
+
+
+@dataclass(frozen=True)
+class AirportSearchResult:
+	status: AirportSearchStatus
+	airport: AirportInfo | None = None
+	distance_nm: float | None = None
+
+
 @dataclass(frozen=True)
 class RunwayInfo:
 	airport_ident: str
 	end_ident: str
 	end_elevation_ft: int
-	nm: float
+	distance_nm: float
 
 
 class RunwaySearchStatus(str, Enum):
@@ -325,7 +338,9 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 
 			# Don't look further out than the angle of a 3 degree glide slope + 20%.
 			distance_nm = haversine_nm(lat, lon, threshold_lat, threshold_lon)
-			range_nm = (altitude_agl / math.tan(math.radians(3.0))) * 1.20
+			# Convert altitude AGL from feet to nautical miles, then divide by tan(3 degrees).
+			# Add a 20% buffer to account for the fact that the aircraft may be above the glide slope.
+			range_nm = ((altitude_agl / 6076.12) / math.tan(math.radians(3.0))) * 1.20
 			if distance_nm > range_nm:
 				continue
 
@@ -341,17 +356,17 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 				min_closure_nm=0.01 if altitude_agl >= 1000 else None,
 			)
 
-			logging.debug(
-				"Runway check: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm match=%s",
-				runway["airport_ident"],
-				runway["le_ident"],
-				runway["he_ident"],
-				end_ident,
-				distance_nm,
-				cross_track_nm,
-				track_error_deg,
-				closure_nm,
-				is_match,)
+#			logging.debug(
+#				"Runway check: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm match=%s",
+#				runway["airport_ident"],
+#				runway["le_ident"],
+#				runway["he_ident"],
+#				end_ident,
+#				distance_nm,
+#				cross_track_nm,
+#				track_error_deg,
+#				closure_nm,
+#				is_match,)
 
 			if not is_match:
 				continue
@@ -373,17 +388,17 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 	):
 		return RunwaySearchResult(status=RunwaySearchStatus.NOT_FOUND)
 
-	logging.debug(
-		"Runway match: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm",
-		closest["airport_ident"],
-		closest["le_ident"],
-		closest["he_ident"],
-		closest_end_ident,
-		closest_nm,
-		closest_cross_track_nm,
-		closest_track_error_deg,
-		closest_closure_nm,
-	)
+#	logging.debug(
+#		"Runway match: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm",
+#		closest["airport_ident"],
+#		closest["le_ident"],
+#		closest["he_ident"],
+#		closest_end_ident,
+#		closest_nm,
+#		closest_cross_track_nm,
+#		closest_track_error_deg,
+#		closest_closure_nm,
+#	)
 
 	return RunwaySearchResult(
 		status=RunwaySearchStatus.FOUND,
@@ -391,14 +406,14 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 			airport_ident=closest["airport_ident"],
 			end_ident=closest_end_ident,
 			end_elevation_ft=closest_end_elevation_ft,
-			nm=closest_nm
+			distance_nm=closest_nm
 		),
 	)
 
 
 def find_nearest_airport(lat, lon):
 	if lat is None or lon is None:
-		return None, None
+		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
 
 	closest = None
 	closest_nm = None
@@ -410,9 +425,21 @@ def find_nearest_airport(lat, lon):
 			closest_nm = distance_nm
 
 	if closest is None or closest_nm is None:
-		return None, None
+		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
 
-	return closest, closest_nm
+#	logging.debug(
+#		"Nearest airport: %s (%s) elevation=%d dist=%.2fnm",
+#		closest.ident,
+#		closest.location if closest.location else "unknown",
+#		closest.elevation_ft,
+#		closest_nm,
+#	)
+
+	return AirportSearchResult(
+		status=AirportSearchStatus.FOUND,
+		airport=closest,
+		distance_nm=closest_nm,
+	)
 
 
 def find_airport_by_ident(ident):
