@@ -1,0 +1,2 @@
+id,airport_ref,airport_ident,length_ft,width_ft,surface,lighted,closed,le_ident,le_latitude_deg,le_longitude_deg,le_elevation_ft,le_heading_degT,le_displaced_threshold_ft,he_ident,he_latitude_deg,he_longitude_deg,he_elevation_ft,he_heading_degT,he_displaced_threshold_ft
+243411,3488,KDFW,13400,150,CON,1,0,17C,32.91569901,-97.02600098,562,180.3,,35C,32.87889862,-97.02619934,562,0.3,
