@@ -40,7 +40,6 @@ Thumbs.db
 *.sav
 notes.txt
 payload.json
-airports.csv
-runways.csv
+*.csv
 image.jpg
 .~lock.*#
