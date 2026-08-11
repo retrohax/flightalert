@@ -303,7 +303,7 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 	if (
 		lat is None
 		or lon is None
-		or not isinstance(altitude, (int, float))
+		or altitude is None
 		or track is None
 		or last_lat is None
 		or last_lon is None
@@ -334,14 +334,18 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 				end_elevation_ft = runway["he_elevation_ft"]
 
 			# Compute AGL and filter out runways that are out of range.
-			altitude_agl = max(altitude - end_elevation_ft, 0)
+			if isinstance(altitude, str) and altitude == "ground":
+				altitude_agl = 0
+			elif isinstance(altitude, (int, float)):
+				altitude_agl = max(altitude - end_elevation_ft, 0)
+			else:
+				continue
+			if altitude_agl > 10000:
+				continue
 
-			# Don't look further out than the angle of a 3 degree glide slope + 20%.
+			# Filter out runways that are too far away.
 			distance_nm = haversine_nm(lat, lon, threshold_lat, threshold_lon)
-			# Convert altitude AGL from feet to nautical miles, then divide by tan(3 degrees).
-			# Add a 20% buffer to account for the fact that the aircraft may be above the glide slope.
-			range_nm = ((altitude_agl / 6076.12) / math.tan(math.radians(3.0))) * 1.20
-			if distance_nm > range_nm:
+			if distance_nm > 25.0:
 				continue
 
 			is_match, cross_track_nm, track_error_deg, closure_nm = is_on_extended_centerline(
@@ -353,7 +357,7 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 				threshold_lat=threshold_lat,
 				threshold_lon=threshold_lon,
 				runway_heading_degt=runway_heading_degt,
-				min_closure_nm=0.01 if altitude_agl >= 1000 else None,
+				min_closure_nm=0.01 if altitude_agl > 1000 else None,
 			)
 
 #			logging.debug(
