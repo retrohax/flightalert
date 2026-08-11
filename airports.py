@@ -29,6 +29,7 @@ class AirportSearchResult:
 	status: AirportSearchStatus
 	airport: AirportInfo | None = None
 	distance_nm: float | None = None
+	altitude_agl: int | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class RunwaySearchStatus(str, Enum):
 class RunwaySearchResult:
 	status: RunwaySearchStatus
 	runway: RunwayInfo | None = None
+	timeout_seconds: int | None = None
 
 _airports = []
 _runways = []
@@ -360,17 +362,18 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 				min_closure_nm=0.01 if altitude_agl > 1000 else None,
 			)
 
-#			logging.debug(
-#				"Runway check: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm match=%s",
-#				runway["airport_ident"],
-#				runway["le_ident"],
-#				runway["he_ident"],
-#				end_ident,
-#				distance_nm,
-#				cross_track_nm,
-#				track_error_deg,
-#				closure_nm,
-#				is_match,)
+			if runway["airport_ident"] == "VTBD":
+				logging.debug(
+					"Runway check: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm match=%s",
+					runway["airport_ident"],
+					runway["le_ident"],
+					runway["he_ident"],
+					end_ident,
+					distance_nm,
+					cross_track_nm,
+					track_error_deg,
+					closure_nm,
+					is_match,)
 
 			if not is_match:
 				continue
