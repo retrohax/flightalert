@@ -84,7 +84,7 @@ _COLOR_GREEN  = 3066993   # takeoff, airborne
 _COLOR_BLUE   = 3447003   # landing
 
 # List of airports and runways loaded from .csv files.
-_aircraft_stall_speed = 40.0  # knots
+_aircraft_stall_speed = 100.0  # knots
 
 # Useful when starting mid-flight to avoid emitting an airborne event.
 _suppress_first_event = False
@@ -503,14 +503,14 @@ def monitor_plane(registration):
 			airport_source = None
 			if plane_state.last_runway is not None:
 				airport = find_airport_by_ident(plane_state.last_runway.airport_ident)
-				airport_source = "RNWY"
+				airport_source = "RWY"
 			elif plane_state.last_airport_search is not None:
 				if (isinstance(plane_state.last_altitude, str) and plane_state.last_altitude == "ground") \
 					or (plane_state.last_altitude_agl is not None
 					and plane_state.last_altitude_agl <= NEAR_AIRPORT_AGL_THRESHOLD
 					and plane_state.last_airport_search.distance_nm <= NEAR_AIRPORT_NM_THRESHOLD):
 						airport = plane_state.last_airport_search.airport
-						airport_source = "ARPT"
+						airport_source = "APT"
 
 			# Status has changed, determine the transition type and emit an event.
 			logging.debug("Status changed from %s to %s", plane_state.last_status, current_status)
