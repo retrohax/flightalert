@@ -190,7 +190,7 @@ def format_airport_label(code, location):
 
 
 def datetime_now():
-	if _replay_log:
+	if _replay_log is not None:
 		return _replay_timestamp
 	return datetime.now(timezone.utc)
 
@@ -205,9 +205,6 @@ def normalize_poll_interval(seconds):
 
 
 def get_poll_interval(status, altitude_agl, last_contact, last_poll_seconds):
-	if _replay_log:
-		# In replay mode, the log processor is doing the sleeping.
-		return 0
 	if status == 'on_ground':
 		if time_since(last_contact) >= WAIT_FOR_OFFLINE:
 			return POLL_SECONDS_OFFLINE
@@ -369,7 +366,7 @@ def get_next_replay_log_entry():
 
 
 def fetch_snapshot(registration, last_lat, last_lon):
-	if _replay_log:
+	if _replay_log is not None:
 		payload = get_next_replay_log_entry()
 	else:
 		payload = rapidapi_request(
@@ -643,6 +640,9 @@ def monitor_plane(registration):
 				plane_state.last_status
 			)
 		logging.debug("Sleeping for %s before next poll", plane_state.last_poll_seconds)
+		if _replay_log is not None:
+			# In replay mode, the log processor is doing the sleeping.
+			continue
 		time.sleep(plane_state.last_poll_seconds)
 
 
@@ -669,8 +669,6 @@ def main():
 	load_airports(AIRPORTS_CSV_LOCAL_PATH)
 	load_runways(RUNWAYS_CSV_LOCAL_PATH)
 
-	#raise SystemExit(0)
-
 	logging.info("Starting tracker for registration %s", registration)
 
 	if len(sys.argv) >= 3 and sys.argv[2].strip().lower() == "--suppress-first-event":
@@ -682,7 +680,7 @@ def main():
 		global _replay_log
 		_replay_log = sys.argv[3].strip()
 
-	if _replay_log:
+	if _replay_log is not None:
 		if not os.path.isfile(_replay_log):
 			logging.error("Replay log file not found: %s", _replay_log)
 			raise SystemExit(1)
@@ -693,11 +691,11 @@ def main():
 		monitor_plane(registration)
 	except KeyboardInterrupt:
 		logging.info("Tracker interrupted by user; exiting")
-		if _replay_log:
+		if _replay_log is not None:
 			_replay_log.close()
 		raise SystemExit(0)
 	except Exception as exc:
-		if _replay_log:
+		if _replay_log is not None:
 			_replay_log.close()
 		logging.exception("Unexpected error occurred: %s", exc)
 		raise SystemExit(1)
