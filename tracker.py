@@ -66,11 +66,6 @@ WAIT_FOR_RESET_NEAR_AIRPORT = 300
 # The aircraft was "on_ground" and has been offline too long, change polling interval.
 WAIT_FOR_OFFLINE = 3600
 
-# If an aircraft is within this distance and altitude of an airport,
-# we consider it "near" that airport.
-NEAR_AIRPORT_NM_THRESHOLD = 5.0
-NEAR_AIRPORT_AGL_THRESHOLD = 2000
-
 # RapidAPI
 _rapidapi_key = None
 _rapidapi_host = None
@@ -282,11 +277,11 @@ def get_transition(current_status, is_near_airport):
 # example: alt_baro=3, groundspeed=0.1
 # example: alt_baro=41000, groundspeed=24.4
 # example: alt_baro="ground", groundspeed=500
-def is_airborne(altitude, groundspeed):
+def is_airborne(altitude, groundspeed, is_near_airport):
 	if altitude is None:
 		return None
 	if isinstance(altitude, str):
-		if altitude == "ground":
+		if altitude == "ground" and is_near_airport is True:
 			if groundspeed is None or groundspeed <= _aircraft_stall_speed:
 				return False
 		return None
@@ -458,27 +453,21 @@ def fetch_snapshot(registration, last_lat, last_lon):
 	if isinstance(aircraft.get("track"), (int, float)):
 		track = float(aircraft.get("track"))
 
-	# Get the altitude AGL from the runway if established, default to nearest airport.
-	# This is only used by get_poll_interval().
-	altitude_agl = None
-	
-	airport_search = find_nearest_airport(lat, lon)
+	altitude_agl = None	
+	airport_search = find_nearest_airport(lat, lon, altitude)
 	if airport_search.status == AirportSearchStatus.FOUND:
-		if isinstance(altitude, int):
-			altitude_agl = altitude - airport_search.airport.elevation_ft
-			airport_search = replace(airport_search, altitude_agl=altitude_agl)
+		altitude_agl = airport_search.altitude_agl
 		logging.debug(
-			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s",
+			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s, is_near=%s",
 			airport_search.airport.ident,
 			airport_search.airport.location,
 			airport_search.distance_nm,
-			format_altitude(altitude_agl)
+			format_altitude(airport_search.altitude_agl),
+			airport_search.is_near
 		)
 
 	runway_search = find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon)
 	if runway_search.status == RunwaySearchStatus.FOUND:
-		if isinstance(altitude, int):
-			altitude_agl = altitude - runway_search.runway.end_elevation_ft
 		if groundspeed is not None and groundspeed > 0:
 			eta_seconds = round((runway_search.runway.distance_nm / groundspeed) * 3600)
 			runway_search = replace(runway_search, timeout_seconds=eta_seconds + 60)
@@ -572,12 +561,14 @@ def monitor_plane(registration):
 					if snapshot.runway_search.status == RunwaySearchStatus.FOUND:
 						plane_state.last_runway_search = snapshot.runway_search
 
+				is_near_airport = None
 				if snapshot.airport_search.status != AirportSearchStatus.SKIPPED:
 					plane_state.last_airport_search = None
 					if snapshot.airport_search.status == AirportSearchStatus.FOUND:
 						plane_state.last_airport_search = snapshot.airport_search
+						is_near_airport = snapshot.airport_search.is_near
 
-				is_airborne_flag = is_airborne(snapshot.altitude, snapshot.groundspeed)
+				is_airborne_flag = is_airborne(snapshot.altitude, snapshot.groundspeed, is_near_airport)
 				# If is_airborne_flag is not True/False it means airborne status
 				# could not be determined.
 				if is_airborne_flag is True:
@@ -594,14 +585,12 @@ def monitor_plane(registration):
 			if plane_state.last_runway_search is not None:
 				airport = find_airport_by_ident(plane_state.last_runway_search.runway.airport_ident)
 				airport_source = "RWY"
-			elif plane_state.last_airport_search is not None:
-				if (
-					plane_state.last_airport_search.altitude_agl is not None
-					and plane_state.last_airport_search.altitude_agl <= NEAR_AIRPORT_AGL_THRESHOLD
-					and plane_state.last_airport_search.distance_nm <= NEAR_AIRPORT_NM_THRESHOLD
-				):
-					airport = plane_state.last_airport_search.airport
-					airport_source = "APT"
+			elif (
+				plane_state.last_airport_search is not None
+				and plane_state.last_airport_search.is_near is True
+			):
+				airport = plane_state.last_airport_search.airport
+				airport_source = "APT"
 
 			# Status has changed, determine the transition type and emit an event.
 			logging.debug("Status changed from %s to %s", plane_state.last_status, current_status)
@@ -653,8 +642,7 @@ def main():
 	global _rapidapi_key, _rapidapi_host, _rapidapi_base_url
 	_rapidapi_key = os.getenv("RAPIDAPI_KEY")
 	if not _rapidapi_key:
-		logging.error("RAPIDAPI_KEY not set; cannot fetch aircraft data")
-		raise SystemExit(1)
+		logging.warning("RAPIDAPI_KEY not set; cannot fetch aircraft data")
 	_rapidapi_host = "adsbexchange-com1.p.rapidapi.com"
 	_rapidapi_base_url = "https://adsbexchange-com1.p.rapidapi.com/v2"
 

@@ -7,6 +7,11 @@ from enum import Enum
 
 AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
 
+# If an aircraft is within this distance and altitude of an airport,
+# we consider it "near" that airport.
+NEAR_AIRPORT_NM_THRESHOLD = 5.0
+NEAR_AIRPORT_AGL_THRESHOLD = 2000
+
 
 @dataclass(frozen=True)
 class AirportInfo:
@@ -30,6 +35,7 @@ class AirportSearchResult:
 	airport: AirportInfo | None = None
 	distance_nm: float | None = None
 	altitude_agl: int | None = None
+	is_near: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -418,7 +424,7 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 	)
 
 
-def find_nearest_airport(lat, lon):
+def find_nearest_airport(lat, lon, altitude):
 	if lat is None or lon is None:
 		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
 
@@ -442,10 +448,23 @@ def find_nearest_airport(lat, lon):
 #		closest_nm,
 #	)
 
+	altitude_agl = None
+	if isinstance(altitude, int):
+		altitude_agl = altitude - closest.elevation_ft
+
+	is_near = None
+	if closest_nm <= NEAR_AIRPORT_NM_THRESHOLD:
+		if isinstance(altitude, str) and altitude == "ground":
+			is_near = True
+		elif altitude_agl is not None and altitude_agl <= NEAR_AIRPORT_AGL_THRESHOLD:
+			is_near = True
+
 	return AirportSearchResult(
 		status=AirportSearchStatus.FOUND,
 		airport=closest,
 		distance_nm=closest_nm,
+		altitude_agl=altitude_agl,
+		is_near=is_near,
 	)
 
 
