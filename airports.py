@@ -247,6 +247,38 @@ def ang_diff_deg(a, b):
 	return diff
 
 
+def bearing_deg(lat1, lon1, lat2, lon2):
+	# Initial bearing from point 1 to point 2 in degrees true.
+	phi1 = math.radians(lat1)
+	phi2 = math.radians(lat2)
+	dlambda = math.radians(lon2 - lon1)
+	y = math.sin(dlambda) * math.cos(phi2)
+	x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+	return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def destination_point_nm(lat, lon, bearing_deg_true, distance_nm):
+	# Great-circle destination point from start, true bearing, and distance (nm).
+	r_nm = 3440.065
+	phi1 = math.radians(lat)
+	lam1 = math.radians(lon)
+	theta = math.radians(bearing_deg_true)
+	delta = distance_nm / r_nm
+
+	phi2 = math.asin(
+		math.sin(phi1) * math.cos(delta)
+		+ math.cos(phi1) * math.sin(delta) * math.cos(theta)
+	)
+	lam2 = lam1 + math.atan2(
+		math.sin(theta) * math.sin(delta) * math.cos(phi1),
+		math.cos(delta) - math.sin(phi1) * math.sin(phi2),
+	)
+
+	lat2 = math.degrees(phi2)
+	lon2 = ((math.degrees(lam2) + 540.0) % 360.0) - 180.0
+	return lat2, lon2
+
+
 def is_on_extended_centerline(
 	lat,
 	lon,
@@ -440,19 +472,11 @@ def find_nearest_airport(lat, lon, altitude):
 	if closest is None or closest_nm is None:
 		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
 
-#	logging.debug(
-#		"Nearest airport: %s (%s) elevation=%d dist=%.2fnm",
-#		closest.ident,
-#		closest.location if closest.location else "unknown",
-#		closest.elevation_ft,
-#		closest_nm,
-#	)
-
 	altitude_agl = None
 	if isinstance(altitude, int):
 		altitude_agl = altitude - closest.elevation_ft
 
-	is_near = None
+	is_near = False
 	if closest_nm <= NEAR_AIRPORT_NM_THRESHOLD:
 		if isinstance(altitude, str) and altitude == "ground":
 			is_near = True
@@ -468,6 +492,89 @@ def find_nearest_airport(lat, lon, altitude):
 	)
 
 
+def find_airport_most_pointed_to(lat, lon, track):
+	if lat is None or lon is None or track is None:
+		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
+
+	closest = None
+	closest_nm = None
+	closest_bearing_error = None
+
+	for airport in _airports:
+		distance_nm = haversine_nm(lat, lon, airport.lat, airport.lon)
+		if distance_nm > 15.0:
+			continue
+		airport_bearing = bearing_deg(lat, lon, airport.lat, airport.lon)
+		bearing_error = ang_diff_deg(track, airport_bearing)
+		if (
+			closest_bearing_error is None
+			or bearing_error < closest_bearing_error
+			or (bearing_error == closest_bearing_error and distance_nm < closest_nm)
+		):
+			closest = airport
+			closest_nm = distance_nm
+			closest_bearing_error = bearing_error
+
+	if closest is None or closest_nm is None:
+		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
+
+	return AirportSearchResult(
+		status=AirportSearchStatus.FOUND,
+		airport=closest,
+		distance_nm=closest_nm,
+	)
+
+
+def find_touchdown_airport(lat, lon, track, altitude, decent_fpm, groundspeed):
+	if (
+		lat is None
+		or lon is None
+		or track is None
+		or not isinstance(altitude, (int, float))
+		or decent_fpm is None
+		or decent_fpm == 0
+		or groundspeed is None
+		or groundspeed <= 0
+	):
+		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
+
+	closest = None
+	closest_nm = None
+	closest_altitude_agl = None
+
+	for airport in _airports:
+		distance_nm = haversine_nm(lat, lon, airport.lat, airport.lon)
+		if distance_nm > 25.0:
+			continue
+
+		altitude_agl = altitude - airport.elevation_ft
+		if altitude_agl < 0:
+			altitude_agl = 0
+
+		# Estimate touchdown point from descent time and groundspeed.
+		time_to_touchdown_min = altitude_agl / abs(decent_fpm)
+		touchdown_distance_nm = groundspeed * (time_to_touchdown_min / 60.0)
+		touchdown_lat, touchdown_lon = destination_point_nm(lat, lon, track, touchdown_distance_nm)
+		touchdown_to_airport_nm = haversine_nm(touchdown_lat, touchdown_lon, airport.lat, airport.lon)
+		if touchdown_to_airport_nm > 5.0:
+			continue
+
+		if closest_nm is None or distance_nm < closest_nm:
+			closest = airport
+			closest_nm = distance_nm
+			closest_altitude_agl = altitude_agl
+
+	if closest is None or closest_nm is None:
+		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
+
+	return AirportSearchResult(
+		status=AirportSearchStatus.FOUND,
+		airport=closest,
+		distance_nm=closest_nm,
+		altitude_agl=int(round(closest_altitude_agl)) if closest_altitude_agl is not None else None,
+	)
+
+
 def find_airport_by_ident(ident):
 	if not isinstance(ident, str) or not ident.strip():
 		return None
@@ -479,3 +586,11 @@ def find_airport_by_ident(ident):
 			return airport
 
 	return None
+
+
+def is_near_airport(airport_search):
+	if not isinstance(airport_search, AirportSearchResult):
+		return False
+	if airport_search.status != AirportSearchStatus.FOUND:
+		return False
+	return airport_search.is_near is True
