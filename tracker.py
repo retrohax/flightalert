@@ -595,10 +595,7 @@ def monitor_plane(registration):
 				airport = find_airport_by_ident(plane_state.last_runway_search.runway.airport_ident)
 				airport_source = "RWY"
 			elif plane_state.last_airport_search is not None:
-				if isinstance(plane_state.last_altitude, str) and plane_state.last_altitude == "ground":
-					airport = plane_state.last_airport_search.airport
-					airport_source = "APT"
-				elif (
+				if (
 					plane_state.last_airport_search.altitude_agl is not None
 					and plane_state.last_airport_search.altitude_agl <= NEAR_AIRPORT_AGL_THRESHOLD
 					and plane_state.last_airport_search.distance_nm <= NEAR_AIRPORT_NM_THRESHOLD
