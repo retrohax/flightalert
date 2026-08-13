@@ -36,27 +36,8 @@ class AirportSearchResult:
 	distance_nm: float | None = None
 	altitude_agl: int | None = None
 	is_near: bool | None = None
-
-
-@dataclass(frozen=True)
-class RunwayInfo:
-	airport_ident: str
-	end_ident: str
-	end_elevation_ft: int
-	distance_nm: float
-
-
-class RunwaySearchStatus(str, Enum):
-	SKIPPED = "skipped"
-	NOT_FOUND = "not_found"
-	FOUND = "found"
-
-
-@dataclass(frozen=True)
-class RunwaySearchResult:
-	status: RunwaySearchStatus
-	runway: RunwayInfo | None = None
 	timeout_seconds: int | None = None
+
 
 _airports = []
 _runways = []
@@ -339,7 +320,7 @@ def is_on_extended_centerline(
 	return is_match, cross_track_nm, track_error_deg, closure_nm
 
 
-def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
+def find_runway_airport(lat, lon, altitude, track, last_lat, last_lon):
 	if (
 		lat is None
 		or lon is None
@@ -348,7 +329,7 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 		or last_lat is None
 		or last_lon is None
 	):
-		return RunwaySearchResult(status=RunwaySearchStatus.SKIPPED)
+		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
 
 	closest = None
 	closest_nm = None
@@ -431,28 +412,17 @@ def find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon):
 		or closest_end_ident is None
 		or closest_end_elevation_ft is None
 	):
-		return RunwaySearchResult(status=RunwaySearchStatus.NOT_FOUND)
+		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
 
-#	logging.debug(
-#		"Runway match: %s %s/%s end=%s dist=%.2fnm xt=%.2fnm track_err=%.1fdeg closure=%.2fnm",
-#		closest["airport_ident"],
-#		closest["le_ident"],
-#		closest["he_ident"],
-#		closest_end_ident,
-#		closest_nm,
-#		closest_cross_track_nm,
-#		closest_track_error_deg,
-#		closest_closure_nm,
-#	)
+	altitude_agl = None
+	if isinstance(altitude, int):
+		altitude_agl = altitude - closest_end_elevation_ft
 
-	return RunwaySearchResult(
-		status=RunwaySearchStatus.FOUND,
-		runway=RunwayInfo(
-			airport_ident=closest["airport_ident"],
-			end_ident=closest_end_ident,
-			end_elevation_ft=closest_end_elevation_ft,
-			distance_nm=closest_nm
-		),
+	return AirportSearchResult(
+		status=AirportSearchStatus.FOUND,
+		airport=closest,
+		distance_nm=closest_nm,
+		altitude_agl=altitude_agl,
 	)
 
 
@@ -492,47 +462,14 @@ def find_nearest_airport(lat, lon, altitude):
 	)
 
 
-def find_airport_most_pointed_to(lat, lon, track):
-	if lat is None or lon is None or track is None:
-		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
-
-	closest = None
-	closest_nm = None
-	closest_bearing_error = None
-
-	for airport in _airports:
-		distance_nm = haversine_nm(lat, lon, airport.lat, airport.lon)
-		if distance_nm > 15.0:
-			continue
-		airport_bearing = bearing_deg(lat, lon, airport.lat, airport.lon)
-		bearing_error = ang_diff_deg(track, airport_bearing)
-		if (
-			closest_bearing_error is None
-			or bearing_error < closest_bearing_error
-			or (bearing_error == closest_bearing_error and distance_nm < closest_nm)
-		):
-			closest = airport
-			closest_nm = distance_nm
-			closest_bearing_error = bearing_error
-
-	if closest is None or closest_nm is None:
-		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
-
-	return AirportSearchResult(
-		status=AirportSearchStatus.FOUND,
-		airport=closest,
-		distance_nm=closest_nm,
-	)
-
-
 def find_touchdown_airport(lat, lon, track, altitude, decent_fpm, groundspeed):
 	if (
 		lat is None
 		or lon is None
 		or track is None
-		or not isinstance(altitude, (int, float))
+		or not isinstance(altitude, int)
 		or decent_fpm is None
-		or decent_fpm == 0
+		or decent_fpm < 250
 		or groundspeed is None
 		or groundspeed <= 0
 	):
@@ -564,14 +501,18 @@ def find_touchdown_airport(lat, lon, track, altitude, decent_fpm, groundspeed):
 			closest_nm = distance_nm
 			closest_altitude_agl = altitude_agl
 
-	if closest is None or closest_nm is None:
+	if (
+		closest is None
+		or closest_nm is None
+		or closest_altitude_agl is None
+	):
 		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
 
 	return AirportSearchResult(
 		status=AirportSearchStatus.FOUND,
 		airport=closest,
 		distance_nm=closest_nm,
-		altitude_agl=int(round(closest_altitude_agl)) if closest_altitude_agl is not None else None,
+		altitude_agl=closest_altitude_agl,
 	)
 
 

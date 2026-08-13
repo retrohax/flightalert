@@ -33,14 +33,11 @@ from urllib.parse import quote
 from airports import (
 	AirportSearchStatus,
 	AirportSearchResult,
-	RunwaySearchStatus,
-	RunwaySearchResult,
-	find_nearest_airport,
-	find_airport_most_pointed_to,
-	find_airport_by_ident,
 	find_touchdown_airport,
+	find_runway_airport,
+	find_nearest_airport,
+	find_airport_by_ident,
 	is_near_airport,
-	find_nearest_runway,
 	load_airports,
 	load_runways,
 )
@@ -125,8 +122,9 @@ class Snapshot:
 	lat: float | None
 	lon: float | None
 	track: float | None
-	airport_search: AirportSearchResult | None
-	runway_search: RunwaySearchResult | None
+	touchdown_airport: AirportSearchResult | None
+	runway_airport: AirportSearchResult | None
+	nearest_airport: AirportSearchResult | None
 
 
 @dataclass
@@ -141,8 +139,9 @@ class PlaneState:
 	last_status: str = "on_ground"
 	last_poll_seconds: int = POLL_SECONDS_ON_GROUND
 	last_contact: datetime = field(default_factory=lambda: datetime.fromtimestamp(0, timezone.utc))
-	last_airport_search: AirportSearchResult | None = None
-	last_runway_search: RunwaySearchResult | None = None
+	last_touchdown_airport: AirportSearchResult | None = None
+	last_runway_airport: AirportSearchResult | None = None
+	last_nearest_airport: AirportSearchResult | None = None
 
 
 class SnapshotStatus(str, Enum):
@@ -390,16 +389,12 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 		aircraft.get("emergency"),
 	)
 
-	# Required field, can't proceed without it.
-	# aircraft.get("r") is the registration number (tail number) of the aircraft.
 	if isinstance(aircraft.get("r"), str) and aircraft.get("r").strip():
 		aircraft_r = aircraft.get("r").strip().upper()
 	else:
 		logging.debug("Invalid registration value %r; skipping snapshot", aircraft.get("r"))
 		return SnapshotResult(status=SnapshotStatus.ONLINE, snapshot=None)
 
-	# Required field, can't proceed without it.
-	# aircraft.get("hex") is the ICAO 24-bit address of the aircraft, which is a unique identifier.
 	if isinstance(aircraft.get("hex"), str) and aircraft.get("hex").strip():
 		icao = aircraft.get("hex").strip().lower()
 	else:
@@ -451,48 +446,6 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 	if isinstance(aircraft.get("track"), (int, float)):
 		track = float(aircraft.get("track"))
 
-	decent_fpm = None
-	if isinstance(altitude, int) and isinstance(last_altitude, int) and last_contact is not None:
-		decent_fpm = round((last_altitude - altitude) / time_since(last_contact) * 60)
-	
-	if decent_fpm is not None and decent_fpm >= 250:
-		logging.info("Decent rate %dfpm", decent_fpm)
-		airport_search = find_touchdown_airport(lat, lon, track, altitude, decent_fpm, groundspeed)
-		if airport_search.status == AirportSearchStatus.FOUND:
-			logging.info(
-				"Touchdown airport: %s (%s) at %.1fnm",
-				airport_search.airport.ident,
-				airport_search.airport.location,
-				airport_search.distance_nm,
-			)
-
-
-	altitude_agl = None	
-	airport_search = find_nearest_airport(lat, lon, altitude)
-	if airport_search.status == AirportSearchStatus.FOUND:
-		altitude_agl = airport_search.altitude_agl
-		logging.debug(
-			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s, is_near=%s",
-			airport_search.airport.ident,
-			airport_search.airport.location,
-			airport_search.distance_nm,
-			format_altitude(airport_search.altitude_agl),
-			airport_search.is_near
-		)
-
-	runway_search = find_nearest_runway(lat, lon, altitude, track, last_lat, last_lon)
-	if runway_search.status == RunwaySearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((runway_search.runway.distance_nm / groundspeed) * 3600)
-			runway_search = replace(runway_search, timeout_seconds=eta_seconds + 60)
-		logging.info(
-			"Nearest runway: %s (RWY %s) at %.1fnm, altitude_agl=%s",
-			runway_search.runway.airport_ident,
-			runway_search.runway.end_ident,
-			runway_search.runway.distance_nm,
-			format_altitude(altitude_agl)
-		)
-
 	squawk = None
 	if isinstance(aircraft.get("squawk"), str):
 		squawk = aircraft.get("squawk").strip()
@@ -500,6 +453,53 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 	emergency = None
 	if isinstance(aircraft.get("emergency"), str):
 		emergency = aircraft.get("emergency").strip().lower()
+
+	decent_rate = None
+	if isinstance(altitude, int) and isinstance(last_altitude, int) and last_contact is not None:
+		decent_rate = round((last_altitude - altitude) / time_since(last_contact) * 60)
+	if decent_rate is not None:
+		logging.debug("Decent rate %dfpm", decent_rate)
+	touchdown_airport = find_touchdown_airport(lat, lon, track, altitude, decent_rate, groundspeed)
+	if touchdown_airport.status == AirportSearchStatus.FOUND:
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((touchdown_airport.distance_nm / groundspeed) * 3600)
+			touchdown_airport = replace(touchdown_airport, timeout_seconds=eta_seconds + 60)
+		logging.debug(
+			"Touchdown airport: %s (%s) at %.1fnm",
+			touchdown_airport.airport.ident,
+			touchdown_airport.airport.location,
+			touchdown_airport.distance_nm,
+		)
+
+	runway_airport = find_runway_airport(lat, lon, altitude, track, last_lat, last_lon)
+	if runway_airport.status == AirportSearchStatus.FOUND:
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((runway_airport.distance_nm / groundspeed) * 3600)
+			runway_airport = replace(runway_airport, timeout_seconds=eta_seconds + 60)
+		logging.info(
+			"Runway airport: %s (%s) at %.1fnm",
+			runway_airport.airport.ident,
+			runway_airport.airport.location,
+			runway_airport.distance_nm,
+		)
+
+	# Use the field elevation of the nearest airport to calculate altitude AGL (Above Ground Level).
+	# This will be used by the polling interval logic to determine how frequently to poll for updates.
+	altitude_agl = None	
+	nearest_airport = find_nearest_airport(lat, lon, altitude)
+	if nearest_airport.status == AirportSearchStatus.FOUND:
+		altitude_agl = nearest_airport.altitude_agl
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((nearest_airport.distance_nm / groundspeed) * 3600)
+			nearest_airport = replace(nearest_airport, timeout_seconds=eta_seconds + 60)
+		logging.debug(
+			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s, is_near=%s",
+			nearest_airport.airport.ident,
+			nearest_airport.airport.location,
+			nearest_airport.distance_nm,
+			format_altitude(nearest_airport.altitude_agl),
+			nearest_airport.is_near
+		)
 
 	return SnapshotResult(
 		status=SnapshotStatus.ONLINE,
@@ -514,8 +514,9 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 			lat=lat,
 			lon=lon,
 			track=track,
-			airport_search=airport_search,
-			runway_search=runway_search,
+			touchdown_airport=touchdown_airport,
+			nearest_airport=nearest_airport,
+			runway_airport=runway_airport,
 		)
 	)
 
@@ -574,21 +575,17 @@ def monitor_plane(registration):
 				plane_state.last_groundspeed = snapshot.groundspeed
 				plane_state.last_lat = snapshot.lat
 				plane_state.last_lon = snapshot.lon
-
-				if snapshot.runway_search.status != RunwaySearchStatus.SKIPPED:
-					plane_state.last_runway_search = None
-					if snapshot.runway_search.status == RunwaySearchStatus.FOUND:
-						plane_state.last_runway_search = snapshot.runway_search
-
-				if snapshot.airport_search.status != AirportSearchStatus.SKIPPED:
-					plane_state.last_airport_search = None
-					if snapshot.airport_search.status == AirportSearchStatus.FOUND:
-						plane_state.last_airport_search = snapshot.airport_search
+				if snapshot.touchdown_airport.status == AirportSearchStatus.FOUND:
+					plane_state.last_touchdown_airport = snapshot.touchdown_airport
+				if snapshot.runway_airport.status == AirportSearchStatus.FOUND:
+					plane_state.last_runway_airport = snapshot.runway_airport
+				if snapshot.nearest_airport.status == AirportSearchStatus.FOUND:
+					plane_state.last_nearest_airport = snapshot.nearest_airport
 
 				is_airborne_flag = is_airborne(
 					snapshot.altitude,
 					snapshot.groundspeed,
-					is_near_airport(snapshot.airport_search)
+					is_near_airport(snapshot.nearest_airport)
 				)
 				# If is_airborne_flag is not True/False it means airborne status
 				# could not be determined.
@@ -603,11 +600,11 @@ def monitor_plane(registration):
 			# Try to figure out which airport the aircraft is at.
 			airport = None
 			airport_source = None
-			if plane_state.last_runway_search is not None:
-				airport = find_airport_by_ident(plane_state.last_runway_search.runway.airport_ident)
+			if plane_state.last_runway_airport is not None:
+				airport = find_airport_by_ident(plane_state.last_runway_airport.runway.airport_ident)
 				airport_source = "RWY"
-			elif is_near_airport(plane_state.last_airport_search):
-				airport = plane_state.last_airport_search.airport
+			elif is_near_airport(plane_state.last_nearest_airport):
+				airport = plane_state.last_nearest_airport.airport
 				airport_source = "APT"
 
 			# Status has changed, determine the transition type and emit an event.
