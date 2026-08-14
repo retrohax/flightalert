@@ -33,17 +33,19 @@ from urllib.parse import quote
 from airports import (
 	AirportSearchStatus,
 	AirportSearchResult,
-	find_touchdown_airport,
+	find_glideslope_airport,
 	find_runway_airport,
 	find_nearest_airport,
-	find_airport_by_ident,
-	is_near_airport,
 	load_airports,
 	load_runways,
 )
 
 from discord import send_discord_message
 from rapidapi import rapidapi_request
+
+_LOG_LEVEL = logging.DEBUG
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
 RUNWAYS_CSV_LOCAL_PATH = "runways.csv"
@@ -85,16 +87,14 @@ _replay_log = None
 _replay_log_timezone = ZoneInfo("America/Chicago")
 _replay_timestamp = None
 
-_LOG_LEVEL = logging.INFO
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
-
 
 class ReplayAwareFormatter(logging.Formatter):
 	def formatTime(self, record, datefmt=None):
 		dt = _replay_timestamp
 		if dt is None:
-			dt = datetime.fromtimestamp(record.created)
+			dt = datetime.fromtimestamp(record.created, timezone.utc)
+		else:
+			dt = dt.astimezone(_replay_log_timezone)
 		if datefmt:
 			return dt.strftime(datefmt)
 		return dt.isoformat(timespec="seconds")
@@ -122,9 +122,9 @@ class Snapshot:
 	lat: float | None
 	lon: float | None
 	track: float | None
-	touchdown_airport: AirportSearchResult | None
+	glideslope_airport: AirportSearchResult | None
 	runway_airport: AirportSearchResult | None
-	nearest_airport: AirportSearchResult | None
+	local_airport: AirportSearchResult | None
 
 
 @dataclass
@@ -139,9 +139,9 @@ class PlaneState:
 	last_status: str = "on_ground"
 	last_poll_seconds: int = POLL_SECONDS_ON_GROUND
 	last_contact: datetime = field(default_factory=lambda: datetime.fromtimestamp(0, timezone.utc))
-	last_touchdown_airport: AirportSearchResult | None = None
+	last_glideslope_airport: AirportSearchResult | None = None
 	last_runway_airport: AirportSearchResult | None = None
-	last_nearest_airport: AirportSearchResult | None = None
+	last_local_airport: AirportSearchResult | None = None
 
 
 class SnapshotStatus(str, Enum):
@@ -219,7 +219,7 @@ def get_poll_interval(status, altitude_agl, last_contact, last_poll_seconds):
 	return POLL_SECONDS_OFFLINE
 
 
-def emit_transition_event(registration, airport, icao, transition, airport_source):
+def emit_transition_event(registration, airport, icao, transition):
 	if transition is None:
 		logging.debug("No transition event to emit for %s", registration)
 		return
@@ -230,7 +230,7 @@ def emit_transition_event(registration, airport, icao, transition, airport_sourc
 	# Log the transition.
 	log_str = f"{registration} {transition.title()}"
 	if airport_label:
-		log_str += f" at [{airport_source or 'NONE'}] {airport_label}"
+		log_str += f" at {airport_label}"
 	log_str += f" {tracking_url}"
 	logging.info(log_str)
 
@@ -284,7 +284,7 @@ def is_airborne(altitude, groundspeed, is_near_airport):
 	if altitude is None:
 		return None
 	if isinstance(altitude, str):
-		if altitude == "ground" and is_near_airport is True:
+		if altitude == "ground" and is_near_airport:
 			if groundspeed is None or groundspeed <= _aircraft_stall_speed:
 				return False
 		return None
@@ -352,8 +352,6 @@ def get_next_replay_log_entry():
 		value = None if value == "None" else value
 		payload[key] = value
 
-	if not "track" in payload:
-		return None
 	return {"ac": [payload]}
 
 
@@ -442,6 +440,15 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 			except (TypeError, ValueError):
 				pass  # Ignore invalid alt_geom, keep alt_baro value.
 
+	if (
+		isinstance(altitude, int)
+		and altitude == last_altitude
+		and lat == last_lat
+		and lon == last_lon
+	):
+		logging.debug("Stuck aircraft position data in flight; skipping snapshot")
+		return SnapshotResult(status=SnapshotStatus.ONLINE, snapshot=None)
+
 	track = None
 	if isinstance(aircraft.get("track"), (int, float)):
 		track = float(aircraft.get("track"))
@@ -454,51 +461,60 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 	if isinstance(aircraft.get("emergency"), str):
 		emergency = aircraft.get("emergency").strip().lower()
 
-	decent_rate = None
-	if isinstance(altitude, int) and isinstance(last_altitude, int) and last_contact is not None:
-		decent_rate = round((last_altitude - altitude) / time_since(last_contact) * 60)
-	if decent_rate is not None:
-		logging.debug("Decent rate %dfpm", decent_rate)
-	touchdown_airport = find_touchdown_airport(lat, lon, track, altitude, decent_rate, groundspeed)
-	if touchdown_airport.status == AirportSearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((touchdown_airport.distance_nm / groundspeed) * 3600)
-			touchdown_airport = replace(touchdown_airport, timeout_seconds=eta_seconds + 60)
-		logging.debug(
-			"Touchdown airport: %s (%s) at %.1fnm",
-			touchdown_airport.airport.ident,
-			touchdown_airport.airport.location,
-			touchdown_airport.distance_nm,
-		)
-
-	runway_airport = find_runway_airport(lat, lon, altitude, track, last_lat, last_lon)
-	if runway_airport.status == AirportSearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((runway_airport.distance_nm / groundspeed) * 3600)
-			runway_airport = replace(runway_airport, timeout_seconds=eta_seconds + 60)
-		logging.info(
-			"Runway airport: %s (%s) at %.1fnm",
-			runway_airport.airport.ident,
-			runway_airport.airport.location,
-			runway_airport.distance_nm,
-		)
-
 	# Use the field elevation of the nearest airport to calculate altitude AGL (Above Ground Level).
 	# This will be used by the polling interval logic to determine how frequently to poll for updates.
 	altitude_agl = None	
 	nearest_airport = find_nearest_airport(lat, lon, altitude)
 	if nearest_airport.status == AirportSearchStatus.FOUND:
 		altitude_agl = nearest_airport.altitude_agl
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((nearest_airport.distance_nm / groundspeed) * 3600)
-			nearest_airport = replace(nearest_airport, timeout_seconds=eta_seconds + 60)
 		logging.debug(
-			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s, is_near=%s",
+			"Nearest airport: %s (%s) at %.1fnm, altitude_agl=%s",
 			nearest_airport.airport.ident,
 			nearest_airport.airport.location,
 			nearest_airport.distance_nm,
 			format_altitude(nearest_airport.altitude_agl),
-			nearest_airport.is_near
+		)
+
+	descent_rate = None
+	if isinstance(altitude, int) and isinstance(last_altitude, int) and last_contact is not None:
+		descent_rate = round((last_altitude - altitude) / (time_since(last_contact) / 60))
+		if altitude_agl is not None and altitude_agl <= 10000:
+			logging.debug("Descent rate below 10,000ft: %dfpm", descent_rate)
+
+	runway_airport = find_runway_airport(lat, lon, altitude, track, last_lat, last_lon, descent_rate)
+	if runway_airport.status == AirportSearchStatus.FOUND:
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((runway_airport.distance_nm / groundspeed) * 3600)
+			runway_airport = replace(runway_airport, timeout_seconds=eta_seconds + 60)
+		logging.debug(
+			"Runway airport: %s (%s) at %.1fnm",
+			runway_airport.airport.ident,
+			runway_airport.airport.location,
+			runway_airport.distance_nm,
+		)
+
+	glideslope_airport = find_glideslope_airport(lat, lon, track, altitude, descent_rate)
+	if glideslope_airport.status == AirportSearchStatus.FOUND:
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((glideslope_airport.distance_nm / groundspeed) * 3600)
+			glideslope_airport = replace(glideslope_airport, timeout_seconds=eta_seconds + 60)
+		logging.debug(
+			"Glideslope airport: %s (%s) at %.1fnm",
+			glideslope_airport.airport.ident,
+			glideslope_airport.airport.location,
+			glideslope_airport.distance_nm,
+		)
+
+	local_airport = find_nearest_airport(lat, lon, altitude, find_local=True)
+	if local_airport.status == AirportSearchStatus.FOUND:
+		if groundspeed is not None and groundspeed > 0:
+			eta_seconds = round((local_airport.distance_nm / groundspeed) * 3600)
+			local_airport = replace(local_airport, timeout_seconds=eta_seconds + 60)
+		logging.debug(
+			"Local airport: %s (%s) at %.1fnm",
+			local_airport.airport.ident,
+			local_airport.airport.location,
+			local_airport.distance_nm,
 		)
 
 	return SnapshotResult(
@@ -514,9 +530,9 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 			lat=lat,
 			lon=lon,
 			track=track,
-			touchdown_airport=touchdown_airport,
-			nearest_airport=nearest_airport,
+			glideslope_airport=glideslope_airport,
 			runway_airport=runway_airport,
+			local_airport=local_airport,
 		)
 	)
 
@@ -535,6 +551,7 @@ def monitor_plane(registration):
 		)
 		# Save status so we can see if it changed after processing the snapshot.
 		current_status = plane_state.last_status
+		local_airport = None
 
 		if snapshot_result.status == SnapshotStatus.ERROR:
 			# Probably some kind of network error.
@@ -542,22 +559,41 @@ def monitor_plane(registration):
 		elif snapshot_result.status == SnapshotStatus.OFFLINE:
 			# Aircraft is offline.
 			if plane_state.last_status == "airborne":
+				# We might need to assume a landing.
+
 				last_contact_seconds = time_since(plane_state.last_contact)
 
-				if plane_state.last_runway_search is not None:
-					timeout_seconds = plane_state.last_runway_search.timeout_seconds
-					if timeout_seconds is not None and last_contact_seconds > timeout_seconds:
-						logging.debug("Forcing reset after %s seconds of no contact (timeout=%s)", last_contact_seconds, timeout_seconds)
-						# Aircraft should have landed by now.
-						current_status = "on_ground"
+				if (
+					plane_state.last_runway_airport is not None
+					and plane_state.last_runway_airport.status == AirportSearchStatus.FOUND
+					and last_contact_seconds > plane_state.last_runway_airport.timeout_seconds
+				):
+					current_status = "on_ground"
+					local_airport = plane_state.last_runway_airport
+					logging.debug(
+						"Assuming last_runway_airport landing at %s due to timeout (last contact %.1f seconds ago)",
+						local_airport.airport.ident,
+						last_contact_seconds,
+					)
 
-				elif is_near_airport(plane_state.last_airport_search):
-					if last_contact_seconds >= WAIT_FOR_RESET_NEAR_AIRPORT:
-						logging.debug("Forcing reset near airport after %s seconds of no contact", last_contact_seconds)
-						current_status = "on_ground"
+				elif (
+					plane_state.last_glideslope_airport is not None
+					and plane_state.last_glideslope_airport.status == AirportSearchStatus.FOUND
+					and last_contact_seconds > plane_state.last_glideslope_airport.timeout_seconds
+				):
+					current_status = "on_ground"
+					local_airport = plane_state.last_glideslope_airport
+					logging.debug(
+						"Assuming last_glideslope_airport landing at %s due to timeout (last contact %.1f seconds ago)",
+						local_airport.airport.ident,
+						last_contact_seconds,
+					)
 
-				elif last_contact_seconds >= WAIT_FOR_RESET_ENROUTE:
-					logging.debug("Forcing reset enroute after %s seconds of no contact", last_contact_seconds)
+				elif last_contact_seconds > WAIT_FOR_RESET_ENROUTE:
+					logging.debug(
+						"Assuming enroute timeout landing (last contact %.1f seconds ago)",
+						last_contact_seconds,
+					)
 					current_status = "on_ground"
 
 		elif snapshot_result.status == SnapshotStatus.ONLINE:
@@ -575,50 +611,39 @@ def monitor_plane(registration):
 				plane_state.last_groundspeed = snapshot.groundspeed
 				plane_state.last_lat = snapshot.lat
 				plane_state.last_lon = snapshot.lon
-				if snapshot.touchdown_airport.status == AirportSearchStatus.FOUND:
-					plane_state.last_touchdown_airport = snapshot.touchdown_airport
-				if snapshot.runway_airport.status == AirportSearchStatus.FOUND:
+				if snapshot.runway_airport.status != AirportSearchStatus.SKIPPED:
 					plane_state.last_runway_airport = snapshot.runway_airport
-				if snapshot.nearest_airport.status == AirportSearchStatus.FOUND:
-					plane_state.last_nearest_airport = snapshot.nearest_airport
-
+				if snapshot.glideslope_airport.status != AirportSearchStatus.SKIPPED:
+					plane_state.last_glideslope_airport = snapshot.glideslope_airport
+				if snapshot.local_airport.status == AirportSearchStatus.FOUND:
+					plane_state.last_local_airport = snapshot.local_airport
+					local_airport = snapshot.local_airport
 				is_airborne_flag = is_airborne(
 					snapshot.altitude,
 					snapshot.groundspeed,
-					is_near_airport(snapshot.nearest_airport)
+					local_airport is not None
 				)
-				# If is_airborne_flag is not True/False it means airborne status
-				# could not be determined.
 				if is_airborne_flag is True:
 					current_status = "airborne"
 				elif is_airborne_flag is False:
 					current_status = "on_ground"
+				else:
+					# Airborne status could not be determined.
+					pass
 		else:
 			logging.error("Unknown snapshot status %s; skipping", snapshot_result.status)
 
 		if plane_state.last_status != current_status:
-			# Try to figure out which airport the aircraft is at.
-			airport = None
-			airport_source = None
-			if plane_state.last_runway_airport is not None:
-				airport = find_airport_by_ident(plane_state.last_runway_airport.runway.airport_ident)
-				airport_source = "RWY"
-			elif is_near_airport(plane_state.last_nearest_airport):
-				airport = plane_state.last_nearest_airport.airport
-				airport_source = "APT"
-
-			# Status has changed, determine the transition type and emit an event.
 			logging.debug("Status changed from %s to %s", plane_state.last_status, current_status)
 			transition = get_transition(
 				current_status=current_status,
-				is_near_airport=airport is not None,
+				is_near_airport=local_airport is not None,
 			)
 			emit_transition_event(
 				registration=plane_state.last_registration,
-				airport=airport,
+				airport=local_airport.airport if local_airport is not None else None,
 				icao=plane_state.last_icao,
 				transition=transition,
-				airport_source=airport_source
 			)
 			# Update the status.
 			plane_state.last_status = current_status
@@ -675,7 +700,15 @@ def main():
 		global _suppress_first_event
 		_suppress_first_event = True
 		logging.info("The first transition event will be suppressed")
-	
+
+	if len(sys.argv) >= 3 and sys.argv[2].strip().lower() == "--stall-speed":
+		global _aircraft_stall_speed
+		try:
+			_aircraft_stall_speed = float(sys.argv[3].strip())
+			logging.info("Aircraft stall speed set to %.1f knots", _aircraft_stall_speed)
+		except ValueError:
+			logging.warning("Invalid stall speed value %r; using default %.1f knots", sys.argv[3].strip(), _aircraft_stall_speed)
+
 	if len(sys.argv) >= 4 and sys.argv[2].strip().lower() == "--replay-log":
 		global _replay_log
 		_replay_log = sys.argv[3].strip()
