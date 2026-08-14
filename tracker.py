@@ -355,6 +355,20 @@ def get_next_replay_log_entry():
 	return {"ac": [payload]}
 
 
+def touchdown_eta_seconds(distance_nm, groundspeed):
+	if distance_nm is None or distance_nm <= 0:
+		return None
+	if groundspeed is None or groundspeed <= 0:
+		return None
+	final_leg_gs = _aircraft_stall_speed * 1.15
+	approach_leg_gs = (groundspeed - final_leg_gs) / 2 + final_leg_gs
+	approach_leg_nm = max(distance_nm - 4.0, 0)
+	approach_leg_hours = approach_leg_nm / approach_leg_gs
+	final_leg_nm = min(distance_nm, 4.0)
+	final_leg_hours = final_leg_nm / final_leg_gs
+	return round((approach_leg_hours + final_leg_hours) * 3600)
+
+
 def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact):
 	if _replay_log is not None:
 		payload = get_next_replay_log_entry()
@@ -481,40 +495,40 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 		if altitude_agl is not None and altitude_agl <= 10000:
 			logging.debug("Descent rate below 10,000ft: %dfpm", descent_rate)
 
-	runway_airport = find_runway_airport(lat, lon, altitude, track, last_lat, last_lon, descent_rate)
+	runway_airport = find_runway_airport(lat, lon, altitude, track, descent_rate)
 	if runway_airport.status == AirportSearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((runway_airport.distance_nm / groundspeed) * 3600)
-			runway_airport = replace(runway_airport, timeout_seconds=eta_seconds + 60)
+		eta_seconds = touchdown_eta_seconds(runway_airport.distance_nm, groundspeed)
+		runway_airport = replace(runway_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
-			"Runway airport: %s (%s) at %.1fnm",
+			"Runway airport: %s (%s) at %.1fnm, eta: %ss",
 			runway_airport.airport.ident,
 			runway_airport.airport.location,
 			runway_airport.distance_nm,
+			runway_airport.timeout_seconds
 		)
 
 	glideslope_airport = find_glideslope_airport(lat, lon, track, altitude, descent_rate)
 	if glideslope_airport.status == AirportSearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((glideslope_airport.distance_nm / groundspeed) * 3600)
-			glideslope_airport = replace(glideslope_airport, timeout_seconds=eta_seconds + 60)
+		eta_seconds = touchdown_eta_seconds(glideslope_airport.distance_nm, groundspeed)
+		glideslope_airport = replace(glideslope_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
-			"Glideslope airport: %s (%s) at %.1fnm",
+			"Glideslope airport: %s (%s) at %.1fnm, eta: %ss",
 			glideslope_airport.airport.ident,
 			glideslope_airport.airport.location,
 			glideslope_airport.distance_nm,
+			glideslope_airport.timeout_seconds
 		)
 
 	local_airport = find_nearest_airport(lat, lon, altitude, find_local=True)
 	if local_airport.status == AirportSearchStatus.FOUND:
-		if groundspeed is not None and groundspeed > 0:
-			eta_seconds = round((local_airport.distance_nm / groundspeed) * 3600)
-			local_airport = replace(local_airport, timeout_seconds=eta_seconds + 60)
+		eta_seconds = touchdown_eta_seconds(local_airport.distance_nm, groundspeed)
+		local_airport = replace(local_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
-			"Local airport: %s (%s) at %.1fnm",
+			"Local airport: %s (%s) at %.1fnm, eta: %ss",
 			local_airport.airport.ident,
 			local_airport.airport.location,
 			local_airport.distance_nm,
+			local_airport.timeout_seconds
 		)
 
 	return SnapshotResult(

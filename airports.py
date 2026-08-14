@@ -264,27 +264,21 @@ def is_on_extended_centerline(
 	lat,
 	lon,
 	track,
-	last_lat,
-	last_lon,
 	threshold_lat,
 	threshold_lon,
 	runway_heading_degt,
 	xt_max_nm=0.5,
 	track_tol_deg=5.0,
-	min_closure_nm=0.01
 ):
-	# Returns (is_match, cross_track_nm, track_error_deg, closure_nm).
 	if (
 		lat is None
 		or lon is None
 		or track is None
-		or last_lat is None
-		or last_lon is None
 		or threshold_lat is None
 		or threshold_lon is None
 		or runway_heading_degt is None
 	):
-		return False, None, None, None
+		return False, None, None
 
 	r_nm = 3440.065
 
@@ -308,16 +302,9 @@ def is_on_extended_centerline(
 
 	track_error_deg = ang_diff_deg(track, runway_heading_degt)
 
-	last_dist_nm = haversine_nm(last_lat, last_lon, threshold_lat, threshold_lon)
-	closure_nm = last_dist_nm - dist13_nm
+	is_match = cross_track_nm <= xt_max_nm and track_error_deg <= track_tol_deg
 
-	is_match = (
-		cross_track_nm <= xt_max_nm
-		and track_error_deg <= track_tol_deg
-		and (min_closure_nm is None or closure_nm >= min_closure_nm)
-	)
-
-	return is_match, cross_track_nm, track_error_deg, closure_nm
+	return is_match, cross_track_nm, track_error_deg
 
 
 def find_glideslope_airport(lat, lon, track, altitude, descent_rate):
@@ -373,14 +360,12 @@ def find_glideslope_airport(lat, lon, track, altitude, descent_rate):
 	)
 
 
-def find_runway_airport(lat, lon, altitude, track, last_lat, last_lon, descent_rate):
+def find_runway_airport(lat, lon, altitude, track, descent_rate):
 	if (
 		lat is None
 		or lon is None
 		or altitude is None
 		or track is None
-		or last_lat is None
-		or last_lon is None
 		or descent_rate is None
 	):
 		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
@@ -423,16 +408,13 @@ def find_runway_airport(lat, lon, altitude, track, last_lat, last_lon, descent_r
 			if distance_nm > 25.0:
 				continue
 
-			is_match, cross_track_nm, track_error_deg, closure_nm = is_on_extended_centerline(
+			is_match, cross_track_nm, track_error_deg = is_on_extended_centerline(
 				lat=lat,
 				lon=lon,
 				track=track,
-				last_lat=last_lat,
-				last_lon=last_lon,
 				threshold_lat=threshold_lat,
 				threshold_lon=threshold_lon,
 				runway_heading_degt=runway_heading_degt,
-				min_closure_nm=0.01 if altitude_agl > 1000 else None,
 			)
 
 			if not is_match:
@@ -456,6 +438,7 @@ def find_runway_airport(lat, lon, altitude, track, last_lat, last_lon, descent_r
 	if isinstance(altitude, int):
 		altitude_agl = altitude - closest_end_elevation_ft
 
+	# Find the the airport that goes with the runway.
 	airport = next((a for a in _airports if a.ident == closest["airport_ident"]), None)
 
 	return AirportSearchResult(
