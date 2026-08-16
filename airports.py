@@ -375,7 +375,9 @@ def find_runway_airport(lat, lon, altitude, track, descent_rate):
 	):
 		return AirportSearchResult(status=AirportSearchStatus.SKIPPED)
 
-	if descent_rate <= 0:
+	# Leave a little buffer, aircraft may level or climb slightly while waiting
+	# to intercept the glideslope.
+	if descent_rate <= -200:
 		return AirportSearchResult(status=AirportSearchStatus.NOT_FOUND)
 
 	closest = None
