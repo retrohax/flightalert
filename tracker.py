@@ -27,7 +27,6 @@ import time
 from enum import Enum
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
 from airports import (
@@ -43,9 +42,9 @@ from airports import (
 from discord import send_discord_message
 from rapidapi import rapidapi_request
 
-_LOG_LEVEL = logging.DEBUG
+_LOG_LEVEL = logging.INFO
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 AIRPORTS_CSV_LOCAL_PATH = "airports.csv"
 RUNWAYS_CSV_LOCAL_PATH = "runways.csv"
@@ -84,30 +83,33 @@ _aircraft_stall_speed = 100.0  # knots
 _suppress_first_event = False
 
 _replay_log = None
-_replay_log_timezone = ZoneInfo("America/Chicago")
 _replay_timestamp = None
 
+_SKIPPED_AIRPORT_RESULT = AirportSearchResult(
+	status=AirportSearchStatus.SKIPPED,
+	timeout_seconds=0,
+)
 
-class ReplayAwareFormatter(logging.Formatter):
-	def formatTime(self, record, datefmt=None):
-		dt = _replay_timestamp
-		if dt is None:
-			dt = datetime.fromtimestamp(record.created, timezone.utc)
-		else:
-			dt = dt.astimezone(_replay_log_timezone)
-		if datefmt:
-			return dt.strftime(datefmt)
-		return dt.isoformat(timespec="seconds")
+
+class ReplayTimestampFilter(logging.Filter):
+	def filter(self, record):
+		if _replay_log is None or _replay_timestamp is None:
+			return True
+		if getattr(record, "_replay_tagged", False):
+			return True
+		replay_local = _replay_timestamp.astimezone()
+		record.created = replay_local.timestamp()
+		record.msecs = replay_local.microsecond / 1000
+		record.relativeCreated = (record.created - logging._startTime) * 1000
+		record._replay_tagged = True
+		return True
 
 logging.basicConfig(
 	level=_LOG_LEVEL,
 	format=_LOG_FORMAT,
 	datefmt=_LOG_DATEFMT,
 )
-
-_replay_formatter = ReplayAwareFormatter(_LOG_FORMAT, _LOG_DATEFMT)
-for _handler in logging.getLogger().handlers:
-	_handler.setFormatter(_replay_formatter)
+logging.getLogger().addFilter(ReplayTimestampFilter())
 
 
 @dataclass
@@ -122,9 +124,9 @@ class Snapshot:
 	lat: float | None
 	lon: float | None
 	track: float | None
-	glideslope_airport: AirportSearchResult | None
-	runway_airport: AirportSearchResult | None
-	local_airport: AirportSearchResult | None
+	runway_airport: AirportSearchResult
+	glideslope_airport: AirportSearchResult
+	local_airport: AirportSearchResult
 
 
 @dataclass
@@ -139,9 +141,8 @@ class PlaneState:
 	last_status: str = "on_ground"
 	last_poll_seconds: int = POLL_SECONDS_ON_GROUND
 	last_contact: datetime = field(default_factory=lambda: datetime.fromtimestamp(0, timezone.utc))
-	last_glideslope_airport: AirportSearchResult | None = None
-	last_runway_airport: AirportSearchResult | None = None
-	last_local_airport: AirportSearchResult | None = None
+	last_runway_airport: AirportSearchResult = field(default_factory=lambda: _SKIPPED_AIRPORT_RESULT)
+	last_glideslope_airport: AirportSearchResult = field(default_factory=lambda: _SKIPPED_AIRPORT_RESULT)
 
 
 class SnapshotStatus(str, Enum):
@@ -300,66 +301,73 @@ def is_airborne(altitude, groundspeed, is_near_airport):
 def get_next_replay_log_entry():
 	global _replay_timestamp
 
-	log_entry = _replay_log.readline()
-	if log_entry == "":
-		logging.debug("End of replay log reached")
-		_replay_log.close()
-		raise SystemExit(0)
+	while True:
+		log_entry = _replay_log.readline()
+		if log_entry == "":
+			logging.debug("End of replay log reached")
+			_replay_log.close()
+			raise SystemExit(0)
 
-	parts = log_entry.split(" ", 3)
-	if len(parts) < 4:
-		logging.warning("Invalid log entry format: %s", log_entry)
-		return None
-
-	timestamp_str = f"{parts[0]} {parts[1]}"
-	try:
-		timestamp_local = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-		timestamp = timestamp_local.replace(tzinfo=_replay_log_timezone).astimezone(timezone.utc)
-	except ValueError:
-		logging.warning("Invalid timestamp format in log entry: %s", timestamp_str)
-		return None
-
-	payload = {}
-	_replay_timestamp = timestamp
-
-	if not parts[3].startswith("registration="):
-		if parts[3].startswith("No data returned"):
-			return payload
-		logging.warning("Invalid log entry format: %s", log_entry)
-		return None
-
-	for pair in parts[3].split():
-		if "=" not in pair:
+		log_entry = log_entry.rstrip("\n")
+		parts = log_entry.split(" ", 2)
+		if len(parts) < 3:
 			continue
-		key, value = pair.split("=", 1)
-		if value.startswith("'") and value.endswith("'"):
-			value = value[1:-1]
-		else:
-			try:
-				value = float(value)
-			except ValueError:
-				pass
-		key = "r" if key == "registration" else key
-		key = "hex" if key == "icao" else key
-		key = "alt_baro" if key == "alt_baro" else key
-		key = "alt_geom" if key == "alt_geom" else key
-		key = "gs" if key == "groundspeed" else key
-		key = "lat" if key == "lat" else key
-		key = "lon" if key == "lon" else key
-		key = "track" if key == "track" else key
-		key = "squawk" if key == "squawk" else key
-		key = "emergency" if key == "emergency" else key
-		value = None if value == "None" else value
-		payload[key] = value
 
-	return {"ac": [payload]}
+		timestamp_str = parts[0]
+		try:
+			timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+		except ValueError:
+			continue
+
+		if timestamp.tzinfo is None:
+			continue
+
+		log_level = parts[1]
+		message = parts[2]
+		if log_level != "DEBUG":
+			continue
+
+		payload = {}
+		_replay_timestamp = timestamp.astimezone(timezone.utc)
+
+		if message.startswith("No data returned"):
+			return payload
+
+		if not message.startswith("registration="):
+			continue
+
+		for pair in message.split():
+			if "=" not in pair:
+				continue
+			key, value = pair.split("=", 1)
+			if value.startswith("'") and value.endswith("'"):
+				value = value[1:-1]
+			else:
+				try:
+					value = float(value)
+				except ValueError:
+					pass
+			key = "r" if key == "registration" else key
+			key = "hex" if key == "icao" else key
+			key = "alt_baro" if key == "alt_baro" else key
+			key = "alt_geom" if key == "alt_geom" else key
+			key = "gs" if key == "groundspeed" else key
+			key = "lat" if key == "lat" else key
+			key = "lon" if key == "lon" else key
+			key = "track" if key == "track" else key
+			key = "squawk" if key == "squawk" else key
+			key = "emergency" if key == "emergency" else key
+			value = None if value == "None" else value
+			payload[key] = value
+
+		return {"ac": [payload]}
 
 
 def touchdown_eta_seconds(distance_nm, groundspeed):
 	if distance_nm is None or distance_nm <= 0:
-		return None
+		return 0
 	if groundspeed is None or groundspeed <= 0:
-		return None
+		return 0
 	final_leg_gs = _aircraft_stall_speed * 1.15
 	approach_leg_gs = (groundspeed - final_leg_gs) / 2 + final_leg_gs
 	approach_leg_nm = max(distance_nm - 4.0, 0)
@@ -495,40 +503,39 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 		if altitude_agl is not None and altitude_agl <= 10000:
 			logging.debug("Descent rate below 10,000ft: %dfpm", descent_rate)
 
+	eta_seconds = 0
 	runway_airport = find_runway_airport(lat, lon, altitude, track, descent_rate)
 	if runway_airport.status == AirportSearchStatus.FOUND:
 		eta_seconds = touchdown_eta_seconds(runway_airport.distance_nm, groundspeed)
-		runway_airport = replace(runway_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
 			"Runway airport: %s (%s) at %.1fnm, eta: %ss",
 			runway_airport.airport.ident,
 			runway_airport.airport.location,
 			runway_airport.distance_nm,
-			runway_airport.timeout_seconds
+			eta_seconds
 		)
+	runway_airport = replace(runway_airport, timeout_seconds=eta_seconds, timestamp=datetime_now())
 
+	eta_seconds = 0
 	glideslope_airport = find_glideslope_airport(lat, lon, track, altitude, descent_rate)
 	if glideslope_airport.status == AirportSearchStatus.FOUND:
 		eta_seconds = touchdown_eta_seconds(glideslope_airport.distance_nm, groundspeed)
-		glideslope_airport = replace(glideslope_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
 			"Glideslope airport: %s (%s) at %.1fnm, eta: %ss",
 			glideslope_airport.airport.ident,
 			glideslope_airport.airport.location,
 			glideslope_airport.distance_nm,
-			glideslope_airport.timeout_seconds
+			eta_seconds
 		)
+	glideslope_airport = replace(glideslope_airport, timeout_seconds=eta_seconds, timestamp=datetime_now())
 
 	local_airport = find_nearest_airport(lat, lon, altitude, find_local=True)
 	if local_airport.status == AirportSearchStatus.FOUND:
-		eta_seconds = touchdown_eta_seconds(local_airport.distance_nm, groundspeed)
-		local_airport = replace(local_airport, timeout_seconds=eta_seconds or 600)
 		logging.debug(
-			"Local airport: %s (%s) at %.1fnm, eta: %ss",
+			"Local airport: %s (%s) at %.1fnm",
 			local_airport.airport.ident,
 			local_airport.airport.location,
 			local_airport.distance_nm,
-			local_airport.timeout_seconds
 		)
 
 	return SnapshotResult(
@@ -576,11 +583,16 @@ def monitor_plane(registration):
 				# We might need to assume a landing.
 
 				last_contact_seconds = time_since(plane_state.last_contact)
+				timeout_seconds = max(
+					plane_state.last_runway_airport.timeout_seconds,
+					plane_state.last_glideslope_airport.timeout_seconds,
+				)
 
 				if (
-					plane_state.last_runway_airport is not None
+					timeout_seconds > 0
 					and plane_state.last_runway_airport.status == AirportSearchStatus.FOUND
-					and last_contact_seconds > plane_state.last_runway_airport.timeout_seconds
+					and plane_state.last_runway_airport.timestamp is not None
+					and time_since(plane_state.last_runway_airport.timestamp) > timeout_seconds
 				):
 					current_status = "on_ground"
 					local_airport = plane_state.last_runway_airport
@@ -591,9 +603,10 @@ def monitor_plane(registration):
 					)
 
 				elif (
-					plane_state.last_glideslope_airport is not None
+					timeout_seconds > 0
 					and plane_state.last_glideslope_airport.status == AirportSearchStatus.FOUND
-					and last_contact_seconds > plane_state.last_glideslope_airport.timeout_seconds
+					and plane_state.last_glideslope_airport.timestamp is not None
+					and time_since(plane_state.last_glideslope_airport.timestamp) > timeout_seconds
 				):
 					current_status = "on_ground"
 					local_airport = plane_state.last_glideslope_airport
@@ -605,7 +618,7 @@ def monitor_plane(registration):
 
 				elif last_contact_seconds > WAIT_FOR_RESET_ENROUTE:
 					logging.debug(
-						"Assuming enroute timeout landing (last contact %.1f seconds ago)",
+						"Aircraft is on the ground by now (last contact %.1f seconds ago)",
 						last_contact_seconds,
 					)
 					current_status = "on_ground"
@@ -630,7 +643,6 @@ def monitor_plane(registration):
 				if snapshot.glideslope_airport.status != AirportSearchStatus.SKIPPED:
 					plane_state.last_glideslope_airport = snapshot.glideslope_airport
 				if snapshot.local_airport.status == AirportSearchStatus.FOUND:
-					plane_state.last_local_airport = snapshot.local_airport
 					local_airport = snapshot.local_airport
 				is_airborne_flag = is_airborne(
 					snapshot.altitude,

@@ -4,6 +4,7 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 
 AIRPORT_TYPES = {"large_airport", "medium_airport", "small_airport"}
 
@@ -35,8 +36,8 @@ class AirportSearchResult:
 	airport: AirportInfo | None = None
 	distance_nm: float | None = None
 	altitude_agl: int | None = None
-	is_near: bool | None = None
 	timeout_seconds: int | None = None
+	timestamp: datetime | None = None
 
 
 _airports = []
@@ -332,13 +333,17 @@ def find_glideslope_airport(lat, lon, track, altitude, descent_rate):
 		if altitude_agl > 10000:
 			continue
 
-		# Estimate touchdown point assuming 3 degree glide slope.
-		glide_angle_deg = 3.0
-		touchdown_distance_nm = altitude_agl / (math.tan(math.radians(glide_angle_deg)) * 6076.12)
-		touchdown_lat, touchdown_lon = destination_point_nm(lat, lon, track, touchdown_distance_nm)
-		touchdown_to_airport_nm = haversine_nm(touchdown_lat, touchdown_lon, airport.lat, airport.lon)
-		if touchdown_to_airport_nm > 5.0:
-			continue
+		if distance_nm < 5.0 and altitude_agl < 1500:
+			# Inside this range, glide angle is less reliable so we just accept the airport as a match.
+			pass
+		else:
+			# Estimate touchdown point assuming 3 degree glide slope.
+			glide_angle_deg = 3.0
+			touchdown_distance_nm = altitude_agl / (math.tan(math.radians(glide_angle_deg)) * 6076.12)
+			touchdown_lat, touchdown_lon = destination_point_nm(lat, lon, track, touchdown_distance_nm)
+			touchdown_to_airport_nm = haversine_nm(touchdown_lat, touchdown_lon, airport.lat, airport.lon)
+			if touchdown_to_airport_nm > 5.0:
+				continue
 
 		if closest_nm is None or distance_nm < closest_nm:
 			closest = airport
