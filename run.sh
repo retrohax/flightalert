@@ -10,7 +10,7 @@ case "$1" in
       echo "already running (pid $(cat "$PIDFILE"))"
       exit 1
     fi
-    nohup python3 tracker.py "$2" "$3" >> "$LOGFILE" 2>&1 &
+    nohup python3 tracker.py "$2" "$3" "$4">> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     echo "started (pid $!)"
     ;;
