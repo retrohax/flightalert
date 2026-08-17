@@ -42,7 +42,7 @@ from airports import (
 from discord import send_discord_message
 from rapidapi import rapidapi_request
 
-_LOG_LEVEL = logging.INFO
+_LOG_LEVEL = logging.DEBUG
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
