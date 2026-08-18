@@ -508,8 +508,9 @@ def fetch_snapshot(registration, last_lat, last_lon, last_altitude, last_contact
 	if runway_airport.status == AirportSearchStatus.FOUND:
 		eta_seconds = touchdown_eta_seconds(runway_airport.distance_nm, groundspeed)
 		logging.debug(
-			"Runway airport: %s (%s) at %.1fnm, eta: %ss",
+			"Runway airport: %s %s (%s) at %.1fnm, eta: %ss",
 			runway_airport.airport.ident,
+			runway_airport.runway_ident,
 			runway_airport.airport.location,
 			runway_airport.distance_nm,
 			eta_seconds

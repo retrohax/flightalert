@@ -35,6 +35,7 @@ class AirportSearchResult:
 	status: AirportSearchStatus
 	airport: AirportInfo | None = None
 	distance_nm: float | None = None
+	runway_ident: str | None = None
 	altitude_agl: int | None = None
 	timeout_seconds: int | None = None
 	timestamp: datetime | None = None
@@ -452,6 +453,7 @@ def find_runway_airport(lat, lon, altitude, track, descent_rate):
 		status=AirportSearchStatus.FOUND,
 		airport=airport,
 		distance_nm=closest_nm,
+		runway_ident=closest_end_ident,
 		altitude_agl=altitude_agl,
 	)
 
