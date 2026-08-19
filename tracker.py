@@ -61,9 +61,7 @@ POLL_THRESHOLD_ALTITUDE_BC = 30000
 
 # The "airborne" aircraft has been offline too long, reset it to "on_ground".
 WAIT_FOR_RESET_ENROUTE = 24*3600
-# The "airborne" aircraft was near an airport and has been offline too long,
-# reset it to "on_ground". This will force a landing event.
-WAIT_FOR_RESET_NEAR_AIRPORT = 300
+
 # The aircraft was "on_ground" and has been offline too long, change polling interval.
 WAIT_FOR_OFFLINE = 3600
 
@@ -169,17 +167,6 @@ def format_altitude(altitude):
 	return "unknown"
 
 
-def format_groundspeed(groundspeed):
-	return f"{groundspeed}kt" if groundspeed is not None else "unknown"
-
-
-def format_seconds(seconds):
-	if seconds is None or seconds < 0:
-		return "unknown"
-	minutes = seconds / 60.0
-	return f"{minutes:0.1f}min"
-
-
 def format_airport_label(code, location):
 	if code is None:
 		return None
@@ -196,11 +183,6 @@ def datetime_now():
 
 def time_since(start_time):
 	return (datetime_now() - start_time).total_seconds()
-
-
-def normalize_poll_interval(seconds):
-	# Round up to the nearest multiple of 60 seconds.
-	return seconds + (60 - seconds % 60) if seconds % 60 != 0 else seconds
 
 
 def get_poll_interval(status, altitude_agl, last_contact, last_poll_seconds):
@@ -693,10 +675,8 @@ def monitor_plane(registration):
 				plane_state.last_status
 			)
 		logging.debug("Sleeping for %s before next poll", plane_state.last_poll_seconds)
-		if _replay_log is not None:
-			# In replay mode, the log processor is doing the sleeping.
-			continue
-		time.sleep(plane_state.last_poll_seconds)
+		if _replay_log is None:
+			time.sleep(plane_state.last_poll_seconds)
 
 
 def main():
